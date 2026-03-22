@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>The Hive — Detail</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <a href="index.html" class="back-btn">← All Hives</a>
+      <img class="logo logo-image" src="bee-logo.svg" alt="The Hive logo" />
+      <span id="page-hive-icon" class="page-hive-icon"></span>
+      <div>
+        <h1 id="page-title">Hive Detail</h1>
+        <p class="subtitle" id="page-subtitle">Live Telemetry</p>
+      </div>
+      <div class="header-meta">
+        <span id="last-updated">—</span>
+        <button id="refresh-btn" onclick="refresh()">↻ Refresh</button>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div id="error-banner" class="error-banner hidden"></div>
+
+    <!-- Hive stats -->
+    <p class="section-label">Hive</p>
+    <section class="stat-grid">
+      <div class="stat-card stat-card--hive">
+        <div class="stat-label">Weight</div>
+        <div class="stat-value" id="stat-weight">—</div>
+        <div class="stat-unit">kg</div>
+      </div>
+      <div class="stat-card stat-card--hive">
+        <div class="stat-label">Temperature</div>
+        <div class="stat-value" id="stat-temp">—</div>
+        <div class="stat-unit">°C</div>
+      </div>
+      <div class="stat-card stat-card--hive">
+        <div class="stat-label">Humidity</div>
+        <div class="stat-value" id="stat-humidity">—</div>
+        <div class="stat-unit">%</div>
+      </div>
+    </section>
+
+    <!-- Monitor stats -->
+    <p class="section-label section-label--minor">Monitor</p>
+    <section class="stat-grid stat-grid--minor">
+      <div class="stat-card stat-card--minor">
+        <div class="stat-label">Battery</div>
+        <div class="stat-value" id="stat-battery-pct">—</div>
+        <div class="stat-unit">%</div>
+      </div>
+      <div class="stat-card stat-card--minor">
+        <div class="stat-label">Voltage</div>
+        <div class="stat-value" id="stat-battery-v">—</div>
+        <div class="stat-unit">V</div>
+      </div>
+      <div class="stat-card stat-card--minor">
+        <div class="stat-label">Charge Rate</div>
+        <div class="stat-value" id="stat-charge-rate">—</div>
+        <div class="stat-unit">%/hr</div>
+      </div>
+      <div class="stat-card stat-card--minor">
+        <div class="stat-label">Battery</div>
+        <div class="stat-value" id="stat-connected">—</div>
+        <div class="stat-unit">status</div>
+      </div>
+    </section>
+
+    <!-- Range selector -->
+    <section class="range-bar">
+      <span class="range-label">Show:</span>
+      <button class="range-btn active" data-hours="24">24h</button>
+      <button class="range-btn" data-hours="72">3d</button>
+      <button class="range-btn" data-hours="168">7d</button>
+      <button class="range-btn" data-hours="720">30d</button>
+      <button class="range-btn" data-hours="0">All</button>
+    </section>
+
+    <!-- Hive charts -->
+    <p class="section-label">Hive</p>
+
+    <div class="chart-card" id="weight-card">
+      <h2>Hive Weight</h2>
+      <div id="chart-weight" class="chart-container"></div>
+      <p class="no-data-msg hidden" id="weight-no-data">No weight data yet — add a weight sensor to your Arduino Thing to enable this chart.</p>
+    </div>
+
+    <div class="chart-card" id="temp-humidity-card">
+      <h2>Temperature &amp; Humidity</h2>
+      <div id="chart-temp-humidity" class="chart-container"></div>
+      <p class="no-data-msg hidden" id="temp-humidity-no-data">No temperature/humidity data yet — add a sensor to your Arduino Thing to enable this chart.</p>
+    </div>
+
+    <!-- Monitor charts -->
+    <p class="section-label section-label--minor">Monitor</p>
+
+    <div class="chart-card chart-card--minor">
+      <h2>Battery Charge</h2>
+      <div id="chart-battery-pct" class="chart-container"></div>
+    </div>
+
+    <div class="chart-card chart-card--minor">
+      <h2>Battery Voltage</h2>
+      <div id="chart-battery-v" class="chart-container"></div>
+    </div>
+
+    <div class="chart-card chart-card--minor">
+      <h2>Charge Rate</h2>
+      <div id="chart-charge-rate" class="chart-container"></div>
+    </div>
+  </main>
+
+  <footer>
+    <span>Data via Arduino Cloud → Google Sheets</span>
+  </footer>
+
+  <script src="hives.js"></script>
+  <script src="dashboard.js"></script>
+</body>
+</html>

@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="beeThoraxFav" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f8cf5a"/>
+      <stop offset="100%" stop-color="#ecad28"/>
+    </linearGradient>
+    <linearGradient id="beeAbdomenFav" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffd968"/>
+      <stop offset="100%" stop-color="#f0b42f"/>
+    </linearGradient>
+  </defs>
+  <ellipse cx="24" cy="19" rx="10" ry="7" fill="#dbeeff" opacity="0.9" transform="rotate(-24 24 19)"/>
+  <ellipse cx="40" cy="19" rx="10" ry="7" fill="#dbeeff" opacity="0.9" transform="rotate(24 40 19)"/>
+  <circle cx="32" cy="24" r="8" fill="url(#beeThoraxFav)"/>
+  <ellipse cx="32" cy="39" rx="12" ry="15" fill="url(#beeAbdomenFav)"/>
+  <path d="M24 31h16" stroke="#2b241b" stroke-width="4" stroke-linecap="round"/>
+  <path d="M22 39h20" stroke="#2b241b" stroke-width="4" stroke-linecap="round"/>
+  <path d="M24 47h16" stroke="#2b241b" stroke-width="4" stroke-linecap="round"/>
+  <path d="M30 51l-3 7" fill="none" stroke="#2b241b" stroke-width="2.8" stroke-linecap="round"/>
+  <path d="M34 51l3 7" fill="none" stroke="#2b241b" stroke-width="2.8" stroke-linecap="round"/>
+  <circle cx="32" cy="14" r="7" fill="#2b241b"/>
+  <path d="M28 8c-1-3-3-5-7-6" fill="none" stroke="#2b241b" stroke-width="2.3" stroke-linecap="round"/>
+  <path d="M36 8c1-3 3-5 7-6" fill="none" stroke="#2b241b" stroke-width="2.3" stroke-linecap="round"/>
+  <circle cx="20.5" cy="2.5" r="1.8" fill="#2b241b"/>
+  <circle cx="43.5" cy="2.5" r="1.8" fill="#2b241b"/>
+  <circle cx="29" cy="13" r="1.6" fill="#fffcf5"/>
+  <circle cx="35" cy="13" r="1.6" fill="#fffcf5"/>
+  <path d="M29 17c1.5 1.5 4.5 1.5 6 0" fill="none" stroke="#fffcf5" stroke-width="1.8" stroke-linecap="round"/>
+</svg>

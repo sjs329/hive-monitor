@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96">
+  <defs>
+    <linearGradient id="beeThorax" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f8cf5a"/>
+      <stop offset="100%" stop-color="#ecad28"/>
+    </linearGradient>
+    <linearGradient id="beeAbdomen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffd968"/>
+      <stop offset="100%" stop-color="#f0b42f"/>
+    </linearGradient>
+  </defs>
+  <ellipse cx="36" cy="28" rx="16" ry="11" fill="#dbeeff" opacity="0.9" transform="rotate(-24 36 28)"/>
+  <ellipse cx="60" cy="28" rx="16" ry="11" fill="#dbeeff" opacity="0.9" transform="rotate(24 60 28)"/>
+  <path d="M38 39c-2 5-2 11 0 16" fill="none" stroke="#2b241b" stroke-width="3" stroke-linecap="round"/>
+  <path d="M48 40c-1 5-1 11 0 16" fill="none" stroke="#2b241b" stroke-width="3" stroke-linecap="round"/>
+  <path d="M58 39c2 5 2 11 0 16" fill="none" stroke="#2b241b" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="48" cy="34" r="12" fill="url(#beeThorax)"/>
+  <ellipse cx="48" cy="55" rx="18" ry="22" fill="url(#beeAbdomen)"/>
+  <path d="M36 44h24" stroke="#2b241b" stroke-width="5" stroke-linecap="round"/>
+  <path d="M33 54h30" stroke="#2b241b" stroke-width="5" stroke-linecap="round"/>
+  <path d="M36 64h24" stroke="#2b241b" stroke-width="5" stroke-linecap="round"/>
+  <path d="M45 75l-4 10" fill="none" stroke="#2b241b" stroke-width="3.5" stroke-linecap="round"/>
+  <path d="M51 75l4 10" fill="none" stroke="#2b241b" stroke-width="3.5" stroke-linecap="round"/>
+  <circle cx="48" cy="20" r="10" fill="#2b241b"/>
+  <path d="M43 11c-2-4-5-6-9-7" fill="none" stroke="#2b241b" stroke-width="3" stroke-linecap="round"/>
+  <path d="M53 11c2-4 5-6 9-7" fill="none" stroke="#2b241b" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="33" cy="4" r="2.3" fill="#2b241b"/>
+  <circle cx="63" cy="4" r="2.3" fill="#2b241b"/>
+  <circle cx="44" cy="18" r="2.2" fill="#fffcf5"/>
+  <circle cx="52" cy="18" r="2.2" fill="#fffcf5"/>
+  <path d="M44 24c2 2 6 2 8 0" fill="none" stroke="#fffcf5" stroke-width="2.4" stroke-linecap="round"/>
+</svg>
