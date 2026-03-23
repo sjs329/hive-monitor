@@ -17,6 +17,7 @@
   These functions are generated with the Thing and added at the end of this sketch.
 */
 
+#include "arduino_secrets.h"
 #include "thingProperties.h"
 #include "Adafruit_MAX1704X.h"
 #include <WiFi.h>
@@ -26,7 +27,7 @@
 
 Adafruit_MAX17048 maxlipo;
 
-const uint64_t SLEEP_INTERVAL_US = 2ULL * 60ULL * 1000000ULL;
+const uint64_t SLEEP_INTERVAL_US = 3ULL * 60ULL * 1000000ULL;
 const uint32_t CLOUD_AWAKE_WINDOW_MS = 15000UL;
 const uint32_t CLOUD_UPDATE_STEP_MS = 100UL;
 const uint32_t BATTERY_RETRY_DELAY_MS = 250UL;

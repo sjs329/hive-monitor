@@ -61,6 +61,12 @@ OTA note:
 
 ## 0) Keep This Repo as Firmware Source of Truth
 
+## OTA Status (Current)
+
+- Local OTA from this repo via `scripts/cloud_ota_upload.ps1` is currently **WIP**.
+- Compile and cloud scheduling paths are in place, but end-to-end automation is still being stabilized against Arduino Cloud API/CLI rate limits and OTA status quirks.
+- For now, use Arduino Cloud web UI as the primary OTA path.
+
 Important behavior:
 - Arduino Cloud CLI does not provide a direct "push local sketch into Cloud Editor source" workflow.
 - To avoid drift, treat `arduino/bee_monitor.ino` in this repo as canonical and avoid editing sketch code in the Cloud Editor.
@@ -94,6 +100,8 @@ Script outputs:
 5. Verify webhook payload and sheet rows.
 
 For OTA firmware updates (no USB cable):
+> Note: Repo-driven OTA automation is currently WIP. Prefer Cloud web UI until this flow is marked stable.
+
 1. In Arduino Cloud Dashboard, turn on `stay_awake_for_update`.
 2. Wait for the next wake (up to `SLEEP_INTERVAL_US`).
 3. Compile and upload OTA from local repo source:
