@@ -3,7 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Replace with your Apps Script /exec URL (no ?key= needed for GET)
-const API_URL = "https://script.google.com/macros/s/AKfycbwymYqw355cC7pl6JCHlLKHBz1hC26OU0tBfs-4658vaRKMWrgtTIkWSh1IGIdeL3cVQQ/exec";
+const API_URL = "https://script.google.com/macros/s/AKfycbztKeecB0nywOhAiUg0raMUyaW7S9CLonxD29ffsRSBea-hPz6Fh6r2kRVEBOIEtKO3GA/exec";
 const FETCH_LIMIT = 2000;
 const AUTO_REFRESH_MS = 60000;
 
