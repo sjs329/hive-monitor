@@ -59,6 +59,32 @@ OTA note:
 
 ## Day-to-Day Workflows
 
+## 0) Keep This Repo as Firmware Source of Truth
+
+Important behavior:
+- Arduino Cloud CLI does not provide a direct "push local sketch into Cloud Editor source" workflow.
+- To avoid drift, treat `arduino/bee_monitor.ino` in this repo as canonical and avoid editing sketch code in the Cloud Editor.
+- Use Cloud for Thing variables, dashboards, and OTA orchestration.
+
+Recommended sync loop:
+1. Edit and commit firmware in this repo.
+2. Export Thing metadata to repo after Cloud-side variable/dashboard changes.
+3. Build/upload firmware from local source (USB or OTA).
+
+Helper scripts:
+
+```powershell
+# Export current Thing definition into repo
+powershell -ExecutionPolicy Bypass -File scripts/cloud_export_thing_template.ps1 -ThingId <THING_ID>
+
+# Compile local sketch and schedule OTA upload
+powershell -ExecutionPolicy Bypass -File scripts/cloud_ota_upload.ps1 -DeviceId <DEVICE_ID> -SketchPath arduino/bee_monitor.ino -Fqbn <FQBN>
+```
+
+Script outputs:
+- `arduino/cloud/thing.template.json` (tracked)
+- `arduino/build/*.bin` (local build artifact)
+
 ## 1) Update Firmware
 
 1. Edit `arduino/bee_monitor.ino`.
@@ -70,8 +96,20 @@ OTA note:
 For OTA firmware updates (no USB cable):
 1. In Arduino Cloud Dashboard, turn on `stay_awake_for_update`.
 2. Wait for the next wake (up to `SLEEP_INTERVAL_US`).
-3. Perform OTA update while the board is awake.
+3. Compile and upload OTA from local repo source:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/cloud_ota_upload.ps1 -DeviceId <DEVICE_ID> -SketchPath arduino/bee_monitor.ino -Fqbn <FQBN>
+```
+
 4. Turn off `stay_awake_for_update` when done.
+
+Tip:
+- For Adafruit Feather ESP32-S3, verify your installed board core FQBN via:
+
+```powershell
+arduino-cli board listall | Select-String "esp32|feather"
+```
 
 ## 2) Update Apps Script from Repo (clasp)
 

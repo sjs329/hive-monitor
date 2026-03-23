@@ -51,13 +51,6 @@ function buildCard(hive, latest) {
   const temp   = hasData && latest.temperature_c != null ? latest.temperature_c.toFixed(1) : null;
   const hum    = hasData && latest.humidity_pct != null ? latest.humidity_pct.toFixed(1) : null;
 
-  const connText = hasData
-    ? (latest.battery_connected === true ? "Connected" : latest.battery_connected === false ? "Disconnected" : "—")
-    : null;
-  const connColor = hasData
-    ? (latest.battery_connected === true ? "var(--accent2)" : latest.battery_connected === false ? "var(--danger)" : "")
-    : "";
-
   if (!hive.active) {
     return `
       <div class="hive-card hive-card--inactive">
@@ -91,7 +84,6 @@ function buildCard(hive, latest) {
       <div class="hc-monitor">
         <span class="hc-monitor-label">Monitor</span>
         <span class="hc-monitor-value">🔋 ${pct != null ? pct + "%" : "—"}</span>
-        <span class="hc-monitor-value" style="color:${connColor}">${connText ?? "—"}</span>
       </div>
       ${lastSeen ? `<div class="hc-footer">Last reading: ${lastSeen}</div>` : ""}
       <div class="hc-cta">View Details →</div>

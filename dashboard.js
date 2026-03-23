@@ -27,6 +27,19 @@ let allRows = [];
 let activeHours = 24;
 let refreshTimer = null;
 
+const SHUTDOWN_PCT = 2;
+const MIN_RATE_FOR_ETA = 0.05;
+// Solar systems can swing over a day; keep trend window short to avoid
+// blending morning charge with overnight drain.
+const EST_WINDOW_HOURS = 4;
+const EST_MIN_SEGMENTS = 3;
+const EST_MAX_POINTS = 240;
+const EST_MIN_DT_HOURS = 1 / 120; // 30s
+const EST_MAX_DT_HOURS = 3;
+const EST_MAX_ABS_RATE = 30;
+const EST_SMOOTHING_HOURS = 0.75;
+const EST_DECAY_HOURS = 1.5;
+
 const PLOTLY_LAYOUT_BASE = {
   paper_bgcolor: "rgba(0,0,0,0)",
   plot_bgcolor:  "rgba(0,0,0,0)",
@@ -58,10 +71,182 @@ function filterByHours(rows, hours) {
   return rows.filter(r => r.ts >= cutoff);
 }
 
+function getPctPoints(rows) {
+  return rows
+    .filter(r => r.battery_pct != null && r.ts instanceof Date && !Number.isNaN(r.ts.getTime()))
+    .sort((a, b) => a.ts - b.ts);
+}
+
+function getTrendPoints(rows, windowHours = EST_WINDOW_HOURS) {
+  const points = getPctPoints(rows);
+  if (!points.length) return [];
+
+  const cutoffMs = Date.now() - windowHours * 3600000;
+  const inWindow = points.filter(p => p.ts.getTime() >= cutoffMs);
+
+  if (inWindow.length >= 2) {
+    return inWindow.slice(-EST_MAX_POINTS);
+  }
+
+  // Fallback to recent points when window is sparse.
+  return points.slice(-Math.min(48, points.length));
+}
+
+function median(values) {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[mid - 1] + sorted[mid]) / 2
+    : sorted[mid];
+}
+
+function buildRateSegments(points) {
+  const segments = [];
+
+  for (let i = 1; i < points.length; i++) {
+    const prev = points[i - 1];
+    const curr = points[i];
+    const dtHours = (curr.ts - prev.ts) / 3600000;
+    if (!Number.isFinite(dtHours) || dtHours < EST_MIN_DT_HOURS || dtHours > EST_MAX_DT_HOURS) continue;
+
+    const rawRate = (curr.battery_pct - prev.battery_pct) / dtHours;
+    if (!Number.isFinite(rawRate) || Math.abs(rawRate) > EST_MAX_ABS_RATE) continue;
+
+    segments.push({
+      ts: curr.ts,
+      dtHours,
+      rawRate,
+    });
+  }
+
+  return segments;
+}
+
+function rejectRateOutliers(segments) {
+  if (segments.length < EST_MIN_SEGMENTS) return segments;
+
+  const rates = segments.map(s => s.rawRate);
+  const med = median(rates);
+  if (med == null) return segments;
+
+  const absDevs = rates.map(r => Math.abs(r - med));
+  const mad = median(absDevs);
+  if (mad == null) return segments;
+
+  // If variation is near-zero, keep close-to-median values.
+  if (mad < 0.02) {
+    const tightThreshold = 0.5;
+    return segments.filter(s => Math.abs(s.rawRate - med) <= tightThreshold);
+  }
+
+  return segments.filter(s => {
+    const robustZ = 0.6745 * (s.rawRate - med) / mad;
+    return Math.abs(robustZ) <= 3.5;
+  });
+}
+
+// Estimate rate from battery % deltas and smooth it for chart readability.
+function buildEstimatedRateSeries(rows) {
+  const points = getTrendPoints(rows);
+  if (points.length < 2) return { x: [], y: [], latestRate: null };
+
+  const segments = rejectRateOutliers(buildRateSegments(points));
+  if (segments.length < EST_MIN_SEGMENTS) return { x: [], y: [], latestRate: null };
+
+  const x = [];
+  const y = [];
+  let smoothed = null;
+
+  for (const seg of segments) {
+    const alpha = 1 - Math.exp(-seg.dtHours / EST_SMOOTHING_HOURS);
+    smoothed = smoothed == null
+      ? seg.rawRate
+      : (alpha * seg.rawRate) + ((1 - alpha) * smoothed);
+
+    x.push(seg.ts);
+    y.push(smoothed);
+  }
+
+  let latestRate = y.length ? y[y.length - 1] : null;
+  if (latestRate != null && x.length) {
+    const nowMs = x[x.length - 1].getTime();
+    let weightSum = 0;
+    let weightedValue = 0;
+
+    for (let i = 0; i < y.length; i++) {
+      const ageHours = (nowMs - x[i].getTime()) / 3600000;
+      const w = Math.exp(-ageHours / EST_DECAY_HOURS);
+      weightedValue += y[i] * w;
+      weightSum += w;
+    }
+
+    if (weightSum > 0) latestRate = weightedValue / weightSum;
+  }
+
+  return {
+    x,
+    y,
+    latestRate,
+  };
+}
+
+function formatDuration(hours) {
+  if (!Number.isFinite(hours) || hours <= 0) return "0m";
+  const totalMinutes = Math.round(hours * 60);
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const remAfterDays = totalMinutes % (24 * 60);
+  const hrs = Math.floor(remAfterDays / 60);
+  const mins = remAfterDays % 60;
+
+  if (days > 0) return `${days}d ${hrs}h`;
+  if (hrs > 0) return `${hrs}h ${mins}m`;
+  return `${mins}m`;
+}
+
+function estimateShutdown(rows) {
+  const points = getTrendPoints(rows);
+  if (!points.length) return { etaText: "—", etaDate: null, hoursLeft: null, rate: null };
+
+  const latest = points[points.length - 1];
+  const { latestRate } = buildEstimatedRateSeries(points);
+
+  if (latestRate == null) {
+    return { etaText: "Estimating", etaDate: null, hoursLeft: null, rate: null };
+  }
+
+  if (latestRate >= -MIN_RATE_FOR_ETA) {
+    return { etaText: "Not draining", etaDate: null, hoursLeft: null, rate: latestRate };
+  }
+
+  const pctRemaining = latest.battery_pct - SHUTDOWN_PCT;
+  if (!Number.isFinite(pctRemaining) || pctRemaining <= 0) {
+    return {
+      etaText: "Now",
+      etaDate: new Date(),
+      hoursLeft: 0,
+      rate: latestRate,
+    };
+  }
+
+  const hoursLeft = pctRemaining / Math.abs(latestRate);
+  if (!Number.isFinite(hoursLeft)) {
+    return { etaText: "—", etaDate: null, hoursLeft: null, rate: latestRate };
+  }
+
+  const etaDate = new Date(Date.now() + (hoursLeft * 3600000));
+  return {
+    etaText: formatDuration(hoursLeft),
+    etaDate,
+    hoursLeft,
+    rate: latestRate,
+  };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Stat cards
 // ─────────────────────────────────────────────────────────────────────────────
-function updateStats(rows) {
+function updateStats(rows, trendRows = rows) {
   if (!rows.length) return;
   const latest = rows[rows.length - 1];
 
@@ -84,11 +269,21 @@ function updateStats(rows) {
   document.getElementById("stat-charge-rate").textContent =
     rate != null ? rate.toFixed(1) : "—";
 
-  const conn = latest.battery_connected;
-  const connEl = document.getElementById("stat-connected");
-  if (conn === true)       { connEl.textContent = "Connected";    connEl.style.color = "var(--accent2)"; }
-  else if (conn === false) { connEl.textContent = "Disconnected"; connEl.style.color = "var(--danger)"; }
-  else                     { connEl.textContent = "—";            connEl.style.color = ""; }
+  const trend = estimateShutdown(trendRows);
+  const estRateEl = document.getElementById("stat-charge-rate-est");
+  estRateEl.textContent = trend.rate != null ? trend.rate.toFixed(1) : "—";
+  estRateEl.style.color = trend.rate != null && trend.rate < 0 ? "var(--danger)" : "var(--accent2)";
+
+  const etaEl = document.getElementById("stat-shutdown-eta");
+  etaEl.textContent = trend.etaText;
+  etaEl.style.color = trend.hoursLeft != null && trend.hoursLeft < 24 ? "var(--danger)" : "var(--ink-mute)";
+  if (trend.etaDate instanceof Date && !Number.isNaN(trend.etaDate.getTime())) {
+    etaEl.setAttribute("data-tooltip", `Estimated shutdown: ${trend.etaDate.toLocaleString()}`);
+    etaEl.setAttribute("aria-label", `Estimated shutdown: ${trend.etaDate.toLocaleString()}`);
+  } else {
+    etaEl.removeAttribute("data-tooltip");
+    etaEl.removeAttribute("aria-label");
+  }
 
   const temp = latest.temperature_c;
   document.getElementById("stat-temp").textContent =
@@ -168,24 +363,36 @@ function renderBatteryVChart(rows) {
 }
 
 function renderChargeRateChart(rows) {
-  const x = rows.map(r => r.ts);
-  const y = rows.map(r => r.battery_charge_rate);
+  const withReported = rows.filter(r => r.battery_charge_rate != null);
+  const x = withReported.map(r => r.ts);
+  const y = withReported.map(r => r.battery_charge_rate);
+  const estimated = buildEstimatedRateSeries(rows);
 
   // Colour positive vs negative (charging vs discharging)
-  Plotly.react("chart-charge-rate", [{
-    x, y,
-    mode: "lines",
-    name: "Charge rate (%/hr)",
-    line: { color: "#c8820a", width: 2 },
-    hovertemplate: "%{y:.1f} %/hr<extra></extra>",
-  }, {
-    x, y: y.map(v => (v != null && v < 0 ? v : null)),
-    mode: "lines",
-    name: "Discharging",
-    line: { color: "var(--danger)", width: 2 },
-    hoverinfo: "skip",
-    showlegend: false,
-  }], {
+  const traces = [];
+
+  if (x.length) {
+    traces.push({
+      x, y,
+      mode: "lines",
+      name: "Arduino rate (%/hr)",
+      line: { color: "#c8820a", width: 2 },
+      hovertemplate: "%{y:.1f} %/hr<extra></extra>",
+    });
+  }
+
+  if (estimated.x.length) {
+    traces.push({
+      x: estimated.x,
+      y: estimated.y,
+      mode: "lines",
+      name: "Web estimate (%/hr)",
+      line: { color: "#1f4f82", width: 2, dash: "dot" },
+      hovertemplate: "%{y:.1f} %/hr<extra></extra>",
+    });
+  }
+
+  Plotly.react("chart-charge-rate", traces, {
     ...layout("%/hr"),
     shapes: [{
       type: "line", y0: 0, y1: 0, x0: 0, x1: 1, xref: "paper",
@@ -251,7 +458,7 @@ document.querySelectorAll(".range-btn").forEach(btn => {
     btn.classList.add("active");
     activeHours = Number(btn.dataset.hours);
     const filtered = filterByHours(allRows, activeHours);
-    updateStats(filtered);
+    updateStats(filtered, allRows);
     renderAll(filtered);
   });
 });
@@ -269,8 +476,15 @@ async function refresh() {
     allRows = await fetchData();
     errBanner.classList.add("hidden");
 
+    // Battery connection should not be shown as a normal stat; only warn on error.
+    const latest = allRows.length ? allRows[allRows.length - 1] : null;
+    if (latest && latest.battery_connected === false) {
+      errBanner.textContent = "Battery error: no battery reported by monitor.";
+      errBanner.classList.remove("hidden");
+    }
+
     const filtered = filterByHours(allRows, activeHours);
-    updateStats(filtered);
+    updateStats(filtered, allRows);
     renderAll(filtered);
 
     document.getElementById("last-updated").textContent =
