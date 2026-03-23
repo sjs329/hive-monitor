@@ -14,15 +14,19 @@ float battery_charge;
 float battery_charge_rate;
 float battery_voltage;
 bool battery_connected;
+bool stay_awake_for_update;
+
+void onStayAwakeForUpdateChange();
 
 void initProperties(){
 
   ArduinoCloud.setBoardId(DEVICE_LOGIN_NAME);
   ArduinoCloud.setSecretDeviceKey(DEVICE_KEY);
-  ArduinoCloud.addProperty(battery_charge, READ, 60 * SECONDS, NULL);
-  ArduinoCloud.addProperty(battery_charge_rate, READ, 60 * SECONDS, NULL);
-  ArduinoCloud.addProperty(battery_voltage, READ, 60 * SECONDS, NULL);
-  ArduinoCloud.addProperty(battery_connected, READ, 60 * SECONDS, NULL);
+  ArduinoCloud.addProperty(battery_charge, READ, 1 * SECONDS, NULL);
+  ArduinoCloud.addProperty(battery_charge_rate, READ, 1 * SECONDS, NULL);
+  ArduinoCloud.addProperty(battery_voltage, READ, 1 * SECONDS, NULL);
+  ArduinoCloud.addProperty(battery_connected, READ, 1 * SECONDS, NULL);
+  ArduinoCloud.addProperty(stay_awake_for_update, READWRITE, ON_CHANGE, onStayAwakeForUpdateChange);
 
 }
 

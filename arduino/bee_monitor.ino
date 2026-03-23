@@ -10,6 +10,7 @@
   float battery_charge_rate;
   float battery_voltage;
   bool battery_connected;
+  bool stay_awake_for_update;
 
   Variables which are marked as READ/WRITE in the Cloud Thing will also have functions
   which are called when their values are changed from the Dashboard.
@@ -18,202 +19,149 @@
 
 #include "thingProperties.h"
 #include "Adafruit_MAX1704X.h"
+#include <WiFi.h>
+#include <Wire.h>
+
+#define DEBUG_SERIAL 0
 
 Adafruit_MAX17048 maxlipo;
 
+const uint64_t SLEEP_INTERVAL_US = 2ULL * 60ULL * 1000000ULL;
+const uint32_t CLOUD_AWAKE_WINDOW_MS = 15000UL;
+const uint32_t CLOUD_UPDATE_STEP_MS = 100UL;
+const uint32_t BATTERY_RETRY_DELAY_MS = 250UL;
+const uint8_t BATTERY_INIT_RETRIES = 5;
+const uint8_t BATTERY_READ_RETRIES = 5;
+const uint32_t STAY_AWAKE_SAMPLE_PERIOD_MS = 30000UL;
+const float MIN_VALID_BATTERY_VOLTAGE = 2.5f;
+
+void disableBoardPowerDraw() {
+  pinMode(NEOPIXEL_POWER, OUTPUT);
+  digitalWrite(NEOPIXEL_POWER, LOW);
+
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+}
+
+bool initBatteryMonitor() {
+  for (uint8_t attempt = 0; attempt < BATTERY_INIT_RETRIES; ++attempt) {
+    if (maxlipo.begin()) {
+      battery_connected = true;
+      maxlipo.setAlertVoltages(2.0, 4.2);
+      return true;
+    }
+
+    delay(BATTERY_RETRY_DELAY_MS);
+  }
+
+  battery_connected = false;
+  battery_voltage = -1.0f;
+  battery_charge = -1.0f;
+  battery_charge_rate = 0.0f;
+  return false;
+}
+
+void readBatteryState() {
+  if (!battery_connected) {
+    return;
+  }
+
+  for (uint8_t attempt = 0; attempt < BATTERY_READ_RETRIES; ++attempt) {
+    const float cellVoltage = maxlipo.cellVoltage();
+    const float cellPercent = maxlipo.cellPercent();
+    const float chargeRate = maxlipo.chargeRate();
+
+    const bool validVoltage = !isnan(cellVoltage) && cellVoltage >= MIN_VALID_BATTERY_VOLTAGE;
+    const bool validPercent = !isnan(cellPercent) && cellPercent >= 0.0f;
+
+    if (validVoltage && validPercent) {
+      battery_connected = true;
+      battery_voltage = cellVoltage;
+      battery_charge = cellPercent;
+      battery_charge_rate = isnan(chargeRate) ? 0.0f : chargeRate;
+      return;
+    }
+
+    delay(BATTERY_RETRY_DELAY_MS);
+  }
+
+  battery_connected = false;
+  battery_voltage = -1.0f;
+  battery_charge = -1.0f;
+  battery_charge_rate = 0.0f;
+}
+
+void publishToCloud() {
+  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
+  setDebugMessageLevel(DEBUG_SERIAL ? 2 : 0);
+
+#if DEBUG_SERIAL
+  ArduinoCloud.printDebugInfo();
+#endif
+
+  const uint32_t wakeStartMs = millis();
+  while (millis() - wakeStartMs < CLOUD_AWAKE_WINDOW_MS) {
+    ArduinoCloud.update();
+    delay(CLOUD_UPDATE_STEP_MS);
+
+    if (stay_awake_for_update) {
+      return;
+    }
+  }
+}
+
+void stayAwakeMode() {
+  uint32_t lastBatterySampleMs = 0;
+
+  while (stay_awake_for_update) {
+    const uint32_t nowMs = millis();
+    if (nowMs - lastBatterySampleMs >= STAY_AWAKE_SAMPLE_PERIOD_MS) {
+      readBatteryState();
+      lastBatterySampleMs = nowMs;
+    }
+
+    ArduinoCloud.update();
+    delay(CLOUD_UPDATE_STEP_MS);
+  }
+}
+
+void enterDeepSleep() {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(20);
+
+  esp_sleep_enable_timer_wakeup(SLEEP_INTERVAL_US);
+  esp_deep_sleep_start();
+}
+
 void setup() {
-  // Initialize serial and wait for port to open:
+#if DEBUG_SERIAL
   Serial.begin(115200);
-  // This delay gives the chance to wait for a Serial Monitor without blocking if none is found
-  delay(1500); 
+  delay(1500);
+#endif
+
+  disableBoardPowerDraw();
+  Wire.begin();
+  delay(BATTERY_RETRY_DELAY_MS);
 
   // Defined in thingProperties.h
   initProperties();
+  initBatteryMonitor();
+  readBatteryState();
+  publishToCloud();
 
-  // Connect to Arduino IoT Cloud
-  ArduinoCloud.begin(ArduinoIoTPreferredConnection);
-  
-  /*
-     The following function allows you to obtain more information
-     related to the state of network and IoT Cloud connection and errors
-     the higher number the more granular information you’ll get.
-     The default is 0 (only errors).
-     Maximum is 4
- */
-  setDebugMessageLevel(2);
-  ArduinoCloud.printDebugInfo();
-
-  // disable NEOPIXEL to reduce power usage
-  pinMode(NEOPIXEL_POWER, OUTPUT);
-  digitalWrite(NEOPIXEL_POWER, LOW);
-  
-  // Set up LED to blink
-  pinMode(LED_BUILTIN, OUTPUT);
-
-  // Battery Monitor Setup
-  Serial.println(F("\nAdafruit MAX17048 advanced demo"));
-
-  const int MAX_BATT_CHECKS = 10;
-  int batt_checks = 0;
-  bool found_battery = true;
-  while (!maxlipo.begin()) {
-    Serial.println(F("Couldnt find Adafruit MAX17048?\nMake sure a battery is plugged in!"));
-    batt_checks++;
-    if (batt_checks >= 10)
-    {
-      found_battery = false;
-      break;
-    }
-    delay(2000);
+  if (stay_awake_for_update) {
+    stayAwakeMode();
   }
-  battery_connected = found_battery;
-  
-  if (found_battery)
-  {
-    Serial.print(F("Found MAX17048"));
-    Serial.print(F(" with Chip ID: 0x")); 
-    Serial.println(maxlipo.getChipID(), HEX);
 
-    // Quick starting allows an instant 'auto-calibration' of the battery. However, its a bad idea
-    // to do this right when the battery is first plugged in or if there's a lot of load on the battery
-    // so uncomment only if you're sure you want to 'reset' the chips charge calculator.
-    // Serial.println("Quick starting");
-    // maxlipo.quickStart();
-    
-    // The reset voltage is what the chip considers 'battery has been removed and replaced'
-    // The default is 3.0 Volts but you can change it here: 
-    //maxlipo.setResetVoltage(2.5);
-    Serial.print(F("Reset voltage = ")); 
-    Serial.print(maxlipo.getResetVoltage());
-    Serial.println(" V");
-  
-    // Hibernation mode reduces how often the ADC is read, for power reduction. There is an automatic
-    // enter/exit mode but you can also customize the activity threshold both as voltage and charge rate
-  
-    //maxlipo.setActivityThreshold(0.15);
-    Serial.print(F("Activity threshold = ")); 
-    Serial.print(maxlipo.getActivityThreshold()); 
-    Serial.println(" V change");
-  
-    //maxlipo.setHibernationThreshold(5);
-    Serial.print(F("Hibernation threshold = "));
-    Serial.print(maxlipo.getHibernationThreshold()); 
-    Serial.println(" %/hour");
-  
-    // You can also 'force' hibernation mode!
-    // maxlipo.hibernate();
-    // ...or force it to wake up!
-    // maxlipo.wake();
-  
-    // The alert pin can be used to detect when the voltage of the battery goes below or
-    // above a voltage, you can also query the alert in the loop.
-    maxlipo.setAlertVoltages(2.0, 4.2);
-  
-    float alert_min, alert_max;
-    maxlipo.getAlertVoltages(alert_min, alert_max);
-    Serial.print("Alert voltages: "); 
-    Serial.print(alert_min); Serial.print(" ~ "); 
-    Serial.print(alert_max); Serial.println(" V");
-  }
-  else
-  {
-    Serial.println("No battery found! Giving up");
-  }
+  enterDeepSleep();
 }
 
-bool led_state = false;
-uint64_t last_change_time_ms = 0ULL;
-const uint64_t BLINK_TIME_MS = 300ULL;
+void loop() {}
 
-uint64_t last_batt_read_time_ms = 0ULL;
-const uint64_t BATT_READ_PERIOD_MS = 2000ULL;
-
-void loop() {
-  ArduinoCloud.update();
-  
-  // Your code here 
-  uint64_t time_now_ms = millis();
-
-  if (time_now_ms - last_change_time_ms >= BLINK_TIME_MS)
-  {
-    digitalWrite(LED_BUILTIN, (led_state ? LOW : HIGH));
-    led_state = !led_state;
-    last_change_time_ms = time_now_ms;
-  }
-
-  // Battery Checking
-  if (battery_connected && (time_now_ms - last_batt_read_time_ms > BATT_READ_PERIOD_MS))
-  {
-    last_batt_read_time_ms = time_now_ms;
-    float cellVoltage = maxlipo.cellVoltage();
-    if (isnan(cellVoltage)) {
-      Serial.println("Failed to read cell voltage, check battery is connected!");
-      cellVoltage = -1.0;
-      battery_connected = false;
-      return;
-    }
-    else
-    {
-      battery_connected = true;
-    }
-
-    battery_voltage = cellVoltage;
-    battery_charge = maxlipo.cellPercent();
-    battery_charge_rate = maxlipo.chargeRate();
-    // Serial.print(F("Batt Voltage: ")); Serial.print(cellVoltage, 3); Serial.println(" V");
-    // Serial.print(F("Batt Percent: ")); Serial.print(battery_charge, 1); Serial.println(" %");
-    // Serial.print(F("(Dis)Charge rate : ")); Serial.print(battery_charge_rate, 1); Serial.println(" %/hr");
-  
-    // we can check if we're hibernating or not
-    // if (maxlipo.isHibernating()) {
-    //   Serial.println(F("Hibernating!"));
-    // }
-  
-  
-    // if (maxlipo.isActiveAlert()) {
-    //   uint8_t status_flags = maxlipo.getAlertStatus();
-    //   Serial.print(F("ALERT! flags = 0x"));
-    //   Serial.print(status_flags, HEX);
-      
-    //   if (status_flags & MAX1704X_ALERTFLAG_SOC_CHANGE) {
-    //     Serial.print(", SOC Change");
-    //     maxlipo.clearAlertFlag(MAX1704X_ALERTFLAG_SOC_CHANGE); // clear the alert
-    //   }
-    //   if (status_flags & MAX1704X_ALERTFLAG_SOC_LOW) {
-    //     Serial.print(", SOC Low");
-    //     maxlipo.clearAlertFlag(MAX1704X_ALERTFLAG_SOC_LOW); // clear the alert
-    //   }
-    //   if (status_flags & MAX1704X_ALERTFLAG_VOLTAGE_RESET) {
-    //     Serial.print(", Voltage reset");
-    //     maxlipo.clearAlertFlag(MAX1704X_ALERTFLAG_VOLTAGE_RESET); // clear the alert
-    //   }
-    //   if (status_flags & MAX1704X_ALERTFLAG_VOLTAGE_LOW) {
-    //     Serial.print(", Voltage low");
-    //     maxlipo.clearAlertFlag(MAX1704X_ALERTFLAG_VOLTAGE_LOW); // clear the alert
-    //   }
-    //   if (status_flags & MAX1704X_ALERTFLAG_VOLTAGE_HIGH) {
-    //     Serial.print(", Voltage high");
-    //     maxlipo.clearAlertFlag(MAX1704X_ALERTFLAG_VOLTAGE_HIGH); // clear the alert
-    //   }
-    //   if (status_flags & MAX1704X_ALERTFLAG_RESET_INDICATOR) {
-    //     Serial.print(", Reset Indicator");
-    //     maxlipo.clearAlertFlag(MAX1704X_ALERTFLAG_RESET_INDICATOR); // clear the alert
-    //   }
-    //   Serial.println();
-    // }
-    // Serial.println();
-    // Serial.println();
-  }
-  
+void onStayAwakeForUpdateChange() {
+#if DEBUG_SERIAL
+  Serial.print("stay_awake_for_update = ");
+  Serial.println(stay_awake_for_update ? "true" : "false");
+#endif
 }
-
-
-
-
-
-
-
-
-
-
-

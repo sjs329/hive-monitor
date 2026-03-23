@@ -2,11 +2,15 @@ const SPREADSHEET_ID = "1_D-joRy7T6VnLgwT06MsVHj62sY71foAJOP2mTBMAFY"; // Hive D
 const SHEET_NAME = "telemetry";
 const SHARED_SECRET = "watson-doesnt-eat-avi-but-poppy-does"; // same secret used in Arduino webhook URL
 const MAX_DEFAULT_ROWS = 1000;
+const DEDUPE_WINDOW_MS = 45000; // collapse burst updates from one wake cycle
 
 // ── Webhook receiver (Arduino Cloud POST) ────────────────────────────────────
 
 function doPost(e) {
+  const lock = LockService.getScriptLock();
   try {
+    lock.waitLock(5000);
+
     if (!e || !e.postData || !e.postData.contents) {
       return json_({ ok: false, error: "Empty POST body" });
     }
@@ -23,23 +27,15 @@ function doPost(e) {
     const merged = mergeWithLastKnownState_(parsed);
 
     const sh = getOrCreateSheet_();
-    sh.appendRow([
-      merged.timestamp_iso,
-      merged.device_id || "",
-      merged.weight_kg ?? "",
-      merged.battery_v ?? "",
-      merged.battery_pct ?? "",
-      merged.battery_charge_rate ?? "",
-      merged.battery_connected ?? "",
-      merged.temperature_c ?? "",
-      merged.humidity_pct ?? "",
-      merged.source || "arduino-cloud",
-      raw
-    ]);
+    upsertTelemetryRow_(sh, merged, raw);
 
     return json_({ ok: true, received: merged });
   } catch (err) {
     return json_({ ok: false, error: String(err) });
+  } finally {
+    try {
+      lock.releaseLock();
+    } catch (ignored) {}
   }
 }
 
@@ -163,13 +159,55 @@ function getOrCreateSheet_() {
   return sh;
 }
 
+function upsertTelemetryRow_(sh, merged, raw) {
+  const rowValues = [
+    merged.timestamp_iso,
+    merged.device_id || "",
+    merged.weight_kg ?? "",
+    merged.battery_v ?? "",
+    merged.battery_pct ?? "",
+    merged.battery_charge_rate ?? "",
+    merged.battery_connected ?? "",
+    merged.temperature_c ?? "",
+    merged.humidity_pct ?? "",
+    merged.source || "arduino-cloud",
+    raw
+  ];
+
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) {
+    sh.appendRow(rowValues);
+    return;
+  }
+
+  const last = sh.getRange(lastRow, 1, 1, 11).getValues()[0];
+  const lastTs = new Date(last[0]);
+  const currentTs = new Date(merged.timestamp_iso);
+  const lastDevice = String(last[1] || "");
+  const currentDevice = String(merged.device_id || "");
+
+  const canDedupe =
+    currentDevice !== "" &&
+    lastDevice === currentDevice &&
+    !isNaN(lastTs.getTime()) &&
+    !isNaN(currentTs.getTime()) &&
+    Math.abs(currentTs.getTime() - lastTs.getTime()) <= DEDUPE_WINDOW_MS;
+
+  if (canDedupe) {
+    sh.getRange(lastRow, 1, 1, 11).setValues([rowValues]);
+    return;
+  }
+
+  sh.appendRow(rowValues);
+}
+
 // ── Debug helper (run from editor to test sheet access) ──────────────────────
 
 function testWrite() {
   const sh = getOrCreateSheet_();
   Logger.log("Sheet found: " + sh.getName());
   Logger.log("Last row: " + sh.getLastRow());
-  sh.appendRow(["TEST", "debug", 99, 4.2, 100, 0.5, true, "test", "debug-payload"]);
+  sh.appendRow(["TEST", "debug", 99, 4.2, 100, 0.5, true, 24.5, 55.0, "test", "debug-payload"]);
   Logger.log("Row appended!");
 }
 
