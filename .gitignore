@@ -1,0 +1,6 @@
+# Arduino local build outputs
+arduino/build/
+
+# Arduino Cloud CLI credentials (project-local, if created)
+arduino-cloud-credentials.yaml
+arduino-cloud-credentials.json
