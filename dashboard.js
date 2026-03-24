@@ -58,7 +58,9 @@ const PLOTLY_LAYOUT_BASE = {
 // Data fetching
 // ─────────────────────────────────────────────────────────────────────────────
 async function fetchData() {
-  const url = `${API_URL}?mode=data&limit=${FETCH_LIMIT}`;
+  const query = new URLSearchParams({ mode: "data", limit: String(FETCH_LIMIT) });
+  if (deviceId) query.set("device_id", deviceId);
+  const url = `${API_URL}?${query.toString()}`;
   const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const json = await res.json();

@@ -137,6 +137,14 @@ clasp.cmd deployments
 clasp.cmd deploy --deploymentId <DEPLOYMENT_ID> --description "update"
 ```
 
+One-command deploy (recommended for this repo):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/deploy_appscript_webapp.ps1
+```
+
+This script pushes local Apps Script files, creates a new version, redeploys the existing web app deployment, and enforces `ANYONE_ANONYMOUS` + `USER_DEPLOYING` based on `appscript/appsscript.json`.
+
 Notes:
 - This repo is linked to an existing script via `.clasp.json`.
 - Use `--deploymentId` to keep the existing `/exec` URL.

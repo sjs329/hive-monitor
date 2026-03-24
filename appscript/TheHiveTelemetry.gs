@@ -3,6 +3,8 @@ const SHEET_NAME = "telemetry";
 const SHARED_SECRET = "watson-doesnt-eat-avi-but-poppy-does"; // same secret used in Arduino webhook URL
 const MAX_DEFAULT_ROWS = 1000;
 const DEDUPE_WINDOW_MS = 45000; // collapse burst updates from one wake cycle
+const GET_CACHE_SECONDS = 30;
+const MAX_CACHE_PAYLOAD_CHARS = 90000;
 
 // ── Webhook receiver (Arduino Cloud POST) ────────────────────────────────────
 
@@ -45,31 +47,139 @@ function doPost(e) {
 function doGet(e) {
   try {
     const mode = (e.parameter && e.parameter.mode) ? e.parameter.mode : "data";
-    if (mode !== "data") return json_({ ok: false, error: "Unsupported mode" });
-
     const limitParam = Number(e.parameter.limit || MAX_DEFAULT_ROWS);
     const limit = Math.min(Math.max(limitParam, 1), 10000);
+    const scanLimitParam = Number(e.parameter.scan_limit || 500);
+    const scanLimit = Math.min(Math.max(scanLimitParam, 1), 5000);
+    const deviceId = (e.parameter && e.parameter.device_id) ? String(e.parameter.device_id) : "";
+    const deviceIds = parseDeviceIds_(e.parameter && e.parameter.device_ids);
+
+    if (mode !== "data" && mode !== "latest") {
+      return json_({ ok: false, error: "Unsupported mode" });
+    }
+
+    const cache = CacheService.getScriptCache();
+    const cacheKey = buildGetCacheKey_(mode, limit, scanLimit, deviceId, deviceIds);
+    const cached = cache.get(cacheKey);
+    if (cached) return jsonText_(cached);
 
     const sh = getOrCreateSheet_();
     const lastRow = sh.getLastRow();
     if (lastRow < 2) return json_({ ok: true, rows: [] });
 
-    const startRow = Math.max(2, lastRow - limit + 1);
-    const numRows = lastRow - startRow + 1;
-    const values = sh.getRange(startRow, 1, numRows, 11).getValues();
-    const rows = values.map(r => ({
-      timestamp_iso: r[0], device_id: r[1],
-      weight_kg: toNumOrNull_(r[2]), battery_v: toNumOrNull_(r[3]),
-      battery_pct: toNumOrNull_(r[4]), battery_charge_rate: toNumOrNull_(r[5]),
-      battery_connected: r[6] === "" ? null : Boolean(r[6]),
-      temperature_c: toNumOrNull_(r[7]), humidity_pct: toNumOrNull_(r[8]),
-      source: r[9]
-    }));
+    let rows = [];
+    if (mode === "latest") {
+      rows = getLatestRowsFromState_(deviceIds);
+      if (!rows.length) {
+        rows = getLatestRows_(sh, lastRow, scanLimit, deviceIds);
+      }
+    } else {
+      rows = getRecentRows_(sh, lastRow, limit, deviceId);
+    }
 
-    return json_({ ok: true, rows: rows });
+    const payload = JSON.stringify({ ok: true, rows: rows });
+    if (payload.length <= MAX_CACHE_PAYLOAD_CHARS) {
+      try {
+        cache.put(cacheKey, payload, GET_CACHE_SECONDS);
+      } catch (cacheErr) {
+        // Cache writes are best-effort only; serve data even if cache rejects payload size.
+      }
+    }
+    return jsonText_(payload);
   } catch (err) {
     return json_({ ok: false, error: String(err) });
   }
+}
+
+function buildGetCacheKey_(mode, limit, scanLimit, deviceId, deviceIds) {
+  const devicePart = deviceId || "all";
+  const deviceIdsPart = deviceIds.length ? deviceIds.join(",") : "all";
+  return ["get", mode, limit, scanLimit, devicePart, deviceIdsPart].join(":");
+}
+
+function parseDeviceIds_(raw) {
+  if (!raw) return [];
+  return String(raw)
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+function mapSheetRows_(values) {
+  return values.map(r => ({
+    timestamp_iso: r[0], device_id: r[1],
+    weight_kg: toNumOrNull_(r[2]), battery_v: toNumOrNull_(r[3]),
+    battery_pct: toNumOrNull_(r[4]), battery_charge_rate: toNumOrNull_(r[5]),
+    battery_connected: r[6] === "" ? null : Boolean(r[6]),
+    temperature_c: toNumOrNull_(r[7]), humidity_pct: toNumOrNull_(r[8]),
+    source: r[9]
+  }));
+}
+
+function getRecentRows_(sh, lastRow, limit, deviceId) {
+  const startRow = Math.max(2, lastRow - limit + 1);
+  const numRows = lastRow - startRow + 1;
+  const values = sh.getRange(startRow, 1, numRows, 11).getValues();
+  const rows = mapSheetRows_(values);
+
+  if (!deviceId) return rows;
+  return rows.filter(r => r.device_id === deviceId);
+}
+
+function getLatestRows_(sh, lastRow, scanLimit, deviceIds) {
+  const startRow = Math.max(2, lastRow - scanLimit + 1);
+  const numRows = lastRow - startRow + 1;
+  const values = sh.getRange(startRow, 1, numRows, 11).getValues();
+  const rows = mapSheetRows_(values);
+  const wanted = deviceIds.length ? new Set(deviceIds) : null;
+  const seen = new Set();
+  const latestRows = [];
+
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const row = rows[i];
+    const did = String(row.device_id || "");
+    if (!did) continue;
+    if (wanted && !wanted.has(did)) continue;
+    if (seen.has(did)) continue;
+
+    seen.add(did);
+    latestRows.push(row);
+
+    if (wanted && seen.size >= wanted.size) break;
+  }
+
+  return latestRows.reverse();
+}
+
+function getLatestRowsFromState_(deviceIds) {
+  const props = PropertiesService.getScriptProperties().getProperties();
+  const wanted = deviceIds.length ? new Set(deviceIds) : null;
+  const rows = [];
+
+  Object.keys(props).forEach(key => {
+    if (!key.startsWith("last_state_")) return;
+
+    try {
+      const row = JSON.parse(props[key]);
+      const did = String((row && row.device_id) || "");
+      if (!did) return;
+      if (wanted && !wanted.has(did)) return;
+      rows.push(row);
+    } catch (ignored) {
+      // Skip malformed state entries.
+    }
+  });
+
+  rows.sort((a, b) => {
+    const ta = Date.parse(a.timestamp_iso || "");
+    const tb = Date.parse(b.timestamp_iso || "");
+    if (!Number.isFinite(ta) && !Number.isFinite(tb)) return 0;
+    if (!Number.isFinite(ta)) return -1;
+    if (!Number.isFinite(tb)) return 1;
+    return ta - tb;
+  });
+
+  return rows;
 }
 
 // ── Payload parser ───────────────────────────────────────────────────────────
@@ -216,6 +326,12 @@ function testWrite() {
 function json_(obj) {
   return ContentService
     .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function jsonText_(text) {
+  return ContentService
+    .createTextOutput(text)
     .setMimeType(ContentService.MimeType.JSON);
 }
 

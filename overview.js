@@ -1,8 +1,15 @@
 // overview.js — landing page logic
 
+const OVERVIEW_CACHE_KEY = "overview_latest_cache_v1";
+const OVERVIEW_CACHE_MAX_AGE_MS = 10 * 60 * 1000;
+
 async function fetchLatestPerDevice() {
-  const url = `${API_URL}?mode=data&limit=${FETCH_LIMIT}`;
-  const res = await fetch(url, { cache: "no-store" });
+  const deviceIds = HIVES_CONFIG
+    .map(hive => hive.device_id)
+    .filter(Boolean)
+    .join(",");
+  const url = `${API_URL}?mode=latest&device_ids=${encodeURIComponent(deviceIds)}&scan_limit=500`;
+  const res = await fetch(url, { cache: "default" });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const json = await res.json();
   if (!json.ok) throw new Error(json.error || "API returned ok:false");
@@ -18,6 +25,49 @@ async function fetchLatestPerDevice() {
     }
   }
   return byDevice;
+}
+
+function saveOverviewCache(byDevice) {
+  try {
+    const payload = {
+      fetchedAt: Date.now(),
+      rows: Object.values(byDevice).map(row => ({
+        ...row,
+        ts: row.ts instanceof Date ? row.ts.toISOString() : row.ts,
+      })),
+    };
+    localStorage.setItem(OVERVIEW_CACHE_KEY, JSON.stringify(payload));
+  } catch (err) {
+    // Non-fatal: cached render is a best-effort optimization.
+  }
+}
+
+function loadOverviewCache() {
+  try {
+    const raw = localStorage.getItem(OVERVIEW_CACHE_KEY);
+    if (!raw) return null;
+
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.rows) || !Number.isFinite(parsed.fetchedAt)) return null;
+
+    const ageMs = Date.now() - parsed.fetchedAt;
+    if (ageMs > OVERVIEW_CACHE_MAX_AGE_MS) return null;
+
+    const byDevice = {};
+    parsed.rows.forEach(row => {
+      const ts = new Date(row.ts || row.timestamp_iso);
+      if (Number.isNaN(ts.getTime())) return;
+      const did = row.device_id || "__unknown__";
+      byDevice[did] = { ...row, ts };
+    });
+
+    return {
+      byDevice,
+      fetchedAt: new Date(parsed.fetchedAt),
+    };
+  } catch (err) {
+    return null;
+  }
 }
 
 function batteryColor(pct) {
@@ -90,6 +140,24 @@ function buildCard(hive, latest) {
     </a>`;
 }
 
+function renderOverviewGrid(byDevice) {
+  const grid = document.getElementById("hive-grid");
+  grid.innerHTML = HIVES_CONFIG.map(hive => {
+    const latest = hive.device_id ? byDevice[hive.device_id] : null;
+    return buildCard(hive, latest || null);
+  }).join("");
+}
+
+function renderCachedOverviewIfAvailable() {
+  const cached = loadOverviewCache();
+  if (!cached) return false;
+
+  renderOverviewGrid(cached.byDevice);
+  document.getElementById("last-updated").textContent =
+    "Updated " + cached.fetchedAt.toLocaleTimeString() + " (cached)";
+  return true;
+}
+
 async function refreshOverview() {
   const btn = document.getElementById("refresh-btn");
   const errBanner = document.getElementById("error-banner");
@@ -100,11 +168,8 @@ async function refreshOverview() {
     const byDevice = await fetchLatestPerDevice();
     errBanner.classList.add("hidden");
 
-    const grid = document.getElementById("hive-grid");
-    grid.innerHTML = HIVES_CONFIG.map(hive => {
-      const latest = hive.device_id ? byDevice[hive.device_id] : null;
-      return buildCard(hive, latest || null);
-    }).join("");
+    renderOverviewGrid(byDevice);
+    saveOverviewCache(byDevice);
 
     document.getElementById("last-updated").textContent =
       "Updated " + new Date().toLocaleTimeString();
@@ -118,6 +183,7 @@ async function refreshOverview() {
 }
 
 // Auto-refresh
+renderCachedOverviewIfAvailable();
 refreshOverview().then(() => {
   setInterval(refreshOverview, AUTO_REFRESH_MS);
 });
