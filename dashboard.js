@@ -29,16 +29,19 @@ let refreshTimer = null;
 
 const SHUTDOWN_PCT = 2;
 const MIN_RATE_FOR_ETA = 0.05;
-// Solar systems can swing over a day; keep trend window short to avoid
-// blending morning charge with overnight drain.
-const EST_WINDOW_HOURS = 4;
-const EST_MIN_SEGMENTS = 3;
-const EST_MAX_POINTS = 240;
-const EST_MIN_DT_HOURS = 1 / 120; // 30s
+const EST_MIN_POINTS = 4;
+const EST_HISTORY_WINDOW_HOURS = 2.25;
+const EST_RECENT_WINDOW_HOURS = 0.9;
+const EST_RECENT_EDGE_HOURS = 2.5;
+const EST_FUTURE_SHARE = 0.35;
+const EST_RECENT_FUTURE_SHARE = 0.12;
+const EST_MIN_DT_HOURS = 1 / 30; // 2m
 const EST_MAX_DT_HOURS = 3;
 const EST_MAX_ABS_RATE = 30;
-const EST_SMOOTHING_HOURS = 0.75;
-const EST_DECAY_HOURS = 1.5;
+const EST_LOCAL_OUTLIER_Z = 3.25;
+const EST_MIN_LOCAL_SPAN_HOURS = 0.4;
+const EST_LATEST_DECAY_HOURS = 0.7;
+const EST_FALLBACK_NEAREST_SEGMENTS = 8;
 
 const PLOTLY_LAYOUT_BASE = {
   paper_bgcolor: "rgba(0,0,0,0)",
@@ -77,21 +80,6 @@ function getPctPoints(rows) {
     .sort((a, b) => a.ts - b.ts);
 }
 
-function getTrendPoints(rows, windowHours = EST_WINDOW_HOURS) {
-  const points = getPctPoints(rows);
-  if (!points.length) return [];
-
-  const cutoffMs = Date.now() - windowHours * 3600000;
-  const inWindow = points.filter(p => p.ts.getTime() >= cutoffMs);
-
-  if (inWindow.length >= 2) {
-    return inWindow.slice(-EST_MAX_POINTS);
-  }
-
-  // Fallback to recent points when window is sparse.
-  return points.slice(-Math.min(48, points.length));
-}
-
 function median(values) {
   if (!values.length) return null;
   const sorted = [...values].sort((a, b) => a - b);
@@ -123,49 +111,121 @@ function buildRateSegments(points) {
   return segments;
 }
 
-function rejectRateOutliers(segments) {
-  if (segments.length < EST_MIN_SEGMENTS) return segments;
+function getLocalWindowConfig(pointTs, endTs) {
+  const edgeHours = Math.max(0, (endTs - pointTs) / 3600000);
+  const nearRightEdge = edgeHours <= EST_RECENT_EDGE_HOURS;
+  const windowHours = nearRightEdge ? EST_RECENT_WINDOW_HOURS : EST_HISTORY_WINDOW_HOURS;
+  const futureShare = nearRightEdge ? EST_RECENT_FUTURE_SHARE : EST_FUTURE_SHARE;
+  const futureHours = windowHours * futureShare;
+  const pastHours = Math.max(windowHours - futureHours, EST_MIN_LOCAL_SPAN_HOURS);
+
+  return {
+    nearRightEdge,
+    pastHours,
+    futureHours,
+  };
+}
+
+function getSegmentsNearTime(segments, targetTs, endTs) {
+  const { pastHours, futureHours } = getLocalWindowConfig(targetTs, endTs);
+  const targetMs = targetTs.getTime();
+  const startMs = targetMs - (pastHours * 3600000);
+  const stopMs = targetMs + (futureHours * 3600000);
+
+  const local = segments.filter(seg => {
+    const segMs = seg.ts.getTime();
+    return segMs >= startMs && segMs <= stopMs;
+  });
+
+  if (local.length >= EST_MIN_POINTS) {
+    return local;
+  }
+
+  return [...segments]
+    .sort((a, b) => Math.abs(a.ts.getTime() - targetMs) - Math.abs(b.ts.getTime() - targetMs))
+    .slice(0, Math.max(EST_FALLBACK_NEAREST_SEGMENTS, EST_MIN_POINTS))
+    .sort((a, b) => a.ts - b.ts);
+}
+
+function filterLocalSegments(segments) {
+  if (segments.length < EST_MIN_POINTS) return segments;
 
   const rates = segments.map(s => s.rawRate);
   const med = median(rates);
-  if (med == null) return segments;
+  const mad = median(rates.map(r => Math.abs(r - med)));
+  if (med == null || mad == null) return segments;
 
-  const absDevs = rates.map(r => Math.abs(r - med));
-  const mad = median(absDevs);
-  if (mad == null) return segments;
-
-  // If variation is near-zero, keep close-to-median values.
-  if (mad < 0.02) {
-    const tightThreshold = 0.5;
-    return segments.filter(s => Math.abs(s.rawRate - med) <= tightThreshold);
+  if (mad < 0.05) {
+    return segments.filter(s => Math.abs(s.rawRate - med) <= 1.0);
   }
 
   return segments.filter(s => {
     const robustZ = 0.6745 * (s.rawRate - med) / mad;
-    return Math.abs(robustZ) <= 3.5;
+    return Math.abs(robustZ) <= EST_LOCAL_OUTLIER_Z;
   });
 }
 
-// Estimate rate from battery % deltas and smooth it for chart readability.
+function tricubeWeight(distanceRatio) {
+  if (!Number.isFinite(distanceRatio) || distanceRatio >= 1) return 0;
+  const term = 1 - Math.pow(distanceRatio, 3);
+  return Math.pow(term, 3);
+}
+
+function weightedLinearSlope(segments, targetTs, endTs) {
+  if (segments.length < EST_MIN_POINTS) return null;
+
+  const targetMs = targetTs.getTime();
+  const distances = segments.map(seg => Math.abs(seg.ts.getTime() - targetMs) / 3600000);
+  const maxDistance = Math.max(...distances, EST_MIN_LOCAL_SPAN_HOURS);
+
+  let sumW = 0;
+  let sumWX = 0;
+  let sumWY = 0;
+  let sumWXX = 0;
+  let sumWXY = 0;
+
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    const distHours = Math.abs(seg.ts.getTime() - targetMs) / 3600000;
+    const x = (seg.ts.getTime() - targetMs) / 3600000;
+    const baseWeight = tricubeWeight(distHours / maxDistance);
+    if (baseWeight <= 0) continue;
+
+    const directionBias = seg.ts <= targetTs ? 1 : 0.75;
+    const w = baseWeight * directionBias * Math.max(seg.dtHours, EST_MIN_DT_HOURS);
+
+    sumW += w;
+    sumWX += w * x;
+    sumWY += w * seg.rawRate;
+    sumWXX += w * x * x;
+    sumWXY += w * x * seg.rawRate;
+  }
+
+  const denom = (sumW * sumWXX) - (sumWX * sumWX);
+  if (!Number.isFinite(denom) || Math.abs(denom) < 1e-6 || sumW <= 0) return null;
+
+  const intercept = ((sumWY * sumWXX) - (sumWX * sumWXY)) / denom;
+  return Number.isFinite(intercept) ? intercept : null;
+}
+
 function buildEstimatedRateSeries(rows) {
-  const points = getTrendPoints(rows);
+  const points = getPctPoints(rows);
   if (points.length < 2) return { x: [], y: [], latestRate: null };
 
-  const segments = rejectRateOutliers(buildRateSegments(points));
-  if (segments.length < EST_MIN_SEGMENTS) return { x: [], y: [], latestRate: null };
+  const segments = buildRateSegments(points);
+  if (segments.length < EST_MIN_POINTS) return { x: [], y: [], latestRate: null };
 
   const x = [];
   const y = [];
-  let smoothed = null;
+  const endTs = points[points.length - 1].ts;
 
   for (const seg of segments) {
-    const alpha = 1 - Math.exp(-seg.dtHours / EST_SMOOTHING_HOURS);
-    smoothed = smoothed == null
-      ? seg.rawRate
-      : (alpha * seg.rawRate) + ((1 - alpha) * smoothed);
+    const local = filterLocalSegments(getSegmentsNearTime(segments, seg.ts, endTs));
+    const slope = weightedLinearSlope(local, seg.ts, endTs);
+    if (slope == null || !Number.isFinite(slope) || Math.abs(slope) > EST_MAX_ABS_RATE) continue;
 
     x.push(seg.ts);
-    y.push(smoothed);
+    y.push(slope);
   }
 
   let latestRate = y.length ? y[y.length - 1] : null;
@@ -176,7 +236,7 @@ function buildEstimatedRateSeries(rows) {
 
     for (let i = 0; i < y.length; i++) {
       const ageHours = (nowMs - x[i].getTime()) / 3600000;
-      const w = Math.exp(-ageHours / EST_DECAY_HOURS);
+      const w = Math.exp(-ageHours / EST_LATEST_DECAY_HOURS);
       weightedValue += y[i] * w;
       weightSum += w;
     }
@@ -205,11 +265,11 @@ function formatDuration(hours) {
 }
 
 function estimateShutdown(rows) {
-  const points = getTrendPoints(rows);
+  const points = getPctPoints(rows);
   if (!points.length) return { etaText: "—", etaDate: null, hoursLeft: null, rate: null };
 
   const latest = points[points.length - 1];
-  const { latestRate } = buildEstimatedRateSeries(points);
+  const { latestRate } = buildEstimatedRateSeries(rows);
 
   if (latestRate == null) {
     return { etaText: "Estimating", etaDate: null, hoursLeft: null, rate: null };
@@ -392,13 +452,19 @@ function renderChargeRateChart(rows) {
     });
   }
 
-  Plotly.react("chart-charge-rate", traces, {
+  const chartLayout = {
     ...layout("%/hr"),
+    xaxis: {
+      ...PLOTLY_LAYOUT_BASE.xaxis,
+      range: rows.length ? [rows[0].ts, rows[rows.length - 1].ts] : undefined,
+    },
     shapes: [{
       type: "line", y0: 0, y1: 0, x0: 0, x1: 1, xref: "paper",
       line: { color: "#e4d9c8", width: 1 }
     }]
-  }, { responsive: true });
+  };
+
+  Plotly.react("chart-charge-rate", traces, chartLayout, { responsive: true });
 }
 
 function renderTempHumidityChart(rows) {
