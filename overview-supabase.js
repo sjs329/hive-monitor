@@ -126,7 +126,7 @@ function buildCard(hive, latest) {
   }
 
   return `
-    <a class="hive-card hive-card--active" href="hive-supabase.html?device=${encodeURIComponent(hive.device_id)}">
+    <a class="hive-card hive-card--active" href="hive.html?device=${encodeURIComponent(hive.device_id)}">
       <div class="hc-header">
         <span class="hc-emoji">${renderHiveIcon(hive)}</span>
         <div>
