@@ -4,3 +4,6 @@ arduino/build/
 # Arduino Cloud CLI credentials (project-local, if created)
 arduino-cloud-credentials.yaml
 arduino-cloud-credentials.json
+
+# NPM stuff
+node_modules/
