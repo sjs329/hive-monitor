@@ -5,6 +5,7 @@ const MAX_DEFAULT_ROWS = 1000;
 const DEDUPE_WINDOW_MS = 45000; // collapse burst updates from one wake cycle
 const GET_CACHE_SECONDS = 30;
 const MAX_CACHE_PAYLOAD_CHARS = 90000;
+const SUPABASE_DUAL_WRITE_ENABLED_DEFAULT = false;
 
 // ── Webhook receiver (Arduino Cloud POST) ────────────────────────────────────
 
@@ -31,7 +32,10 @@ function doPost(e) {
     const sh = getOrCreateSheet_();
     upsertTelemetryRow_(sh, merged, raw);
 
-    return json_({ ok: true, received: merged });
+    // Optional migration path: write to Supabase too, without blocking Sheets writes.
+    const supabase = writeSupabaseBestEffort_(merged, raw);
+
+    return json_({ ok: true, received: merged, supabase: supabase });
   } catch (err) {
     return json_({ ok: false, error: String(err) });
   } finally {
@@ -54,8 +58,13 @@ function doGet(e) {
     const deviceId = (e.parameter && e.parameter.device_id) ? String(e.parameter.device_id) : "";
     const deviceIds = parseDeviceIds_(e.parameter && e.parameter.device_ids);
 
-    if (mode !== "data" && mode !== "latest") {
+    if (mode !== "data" && mode !== "latest" && mode !== "compare") {
       return json_({ ok: false, error: "Unsupported mode" });
+    }
+
+    if (mode === "compare") {
+      const rows = getCompareRows_(deviceIds);
+      return json_({ ok: true, rows: rows });
     }
 
     const cache = CacheService.getScriptCache();
@@ -180,6 +189,105 @@ function getLatestRowsFromState_(deviceIds) {
   });
 
   return rows;
+}
+
+function getCompareRows_(deviceIds) {
+  const sheetRows = getLatestRowsFromState_(deviceIds);
+  const supabaseRows = getSupabaseLatestRows_(deviceIds);
+
+  const wantedIds = deviceIds.length
+    ? deviceIds
+    : uniqueNonEmpty_([
+        sheetRows.map(r => r.device_id),
+        supabaseRows.map(r => r.device_id)
+      ]);
+
+  const sheetByDevice = indexByDeviceId_(sheetRows);
+  const supabaseByDevice = indexByDeviceId_(supabaseRows);
+
+  return wantedIds.map(deviceId => {
+    const sheet = sheetByDevice[deviceId] || null;
+    const supabase = supabaseByDevice[deviceId] || null;
+
+    return {
+      device_id: deviceId,
+      sheets: sheet,
+      supabase: supabase,
+      ts_diff_ms: diffMillis_(sheet && sheet.timestamp_iso, supabase && supabase.timestamp_iso),
+      battery_pct_diff: diffNumber_(sheet && sheet.battery_pct, supabase && supabase.battery_pct),
+      battery_v_diff: diffNumber_(sheet && sheet.battery_v, supabase && supabase.battery_v),
+      battery_charge_rate_diff: diffNumber_(sheet && sheet.battery_charge_rate, supabase && supabase.battery_charge_rate),
+      weight_kg_diff: diffNumber_(sheet && sheet.weight_kg, supabase && supabase.weight_kg),
+      temperature_c_diff: diffNumber_(sheet && sheet.temperature_c, supabase && supabase.temperature_c),
+      humidity_pct_diff: diffNumber_(sheet && sheet.humidity_pct, supabase && supabase.humidity_pct)
+    };
+  });
+}
+
+function getSupabaseLatestRows_(deviceIds) {
+  const cfg = getSupabaseConfig_();
+  if (!cfg.enabled) return [];
+
+  const payload = deviceIds.length ? { p_device_ids: deviceIds } : {};
+  const res = UrlFetchApp.fetch(cfg.url + "/rest/v1/rpc/get_latest", {
+    method: "post",
+    contentType: "application/json",
+    muteHttpExceptions: true,
+    headers: {
+      apikey: cfg.key,
+      Authorization: "Bearer " + cfg.key,
+      "User-Agent": "the-hive-appscript/1.0",
+      "X-Client-Info": "the-hive-appscript/1.0"
+    },
+    payload: JSON.stringify(payload)
+  });
+
+  const code = Number(res.getResponseCode());
+  if (code < 200 || code >= 300) {
+    Logger.log("Supabase compare fetch failed (%s): %s", code, String(res.getContentText() || ""));
+    return [];
+  }
+
+  const rows = JSON.parse(String(res.getContentText() || "[]"));
+  return Array.isArray(rows) ? rows : [];
+}
+
+function indexByDeviceId_(rows) {
+  const byDevice = {};
+  (rows || []).forEach(row => {
+    const did = String((row && row.device_id) || "");
+    if (!did) return;
+    byDevice[did] = row;
+  });
+  return byDevice;
+}
+
+function uniqueNonEmpty_(groups) {
+  const seen = {};
+  const out = [];
+  (groups || []).forEach(group => {
+    (group || []).forEach(value => {
+      const text = String(value || "");
+      if (!text || seen[text]) return;
+      seen[text] = true;
+      out.push(text);
+    });
+  });
+  return out;
+}
+
+function diffNumber_(a, b) {
+  const na = Number(a);
+  const nb = Number(b);
+  if (!Number.isFinite(na) || !Number.isFinite(nb)) return null;
+  return na - nb;
+}
+
+function diffMillis_(a, b) {
+  const ta = Date.parse(String(a || ""));
+  const tb = Date.parse(String(b || ""));
+  if (!Number.isFinite(ta) || !Number.isFinite(tb)) return null;
+  return ta - tb;
 }
 
 // ── Payload parser ───────────────────────────────────────────────────────────
@@ -311,6 +419,216 @@ function upsertTelemetryRow_(sh, merged, raw) {
   sh.appendRow(rowValues);
 }
 
+// ── Optional dual-write to Supabase (best effort) ───────────────────────────
+
+function getSupabaseConfig_() {
+  const props = PropertiesService.getScriptProperties();
+  const enabledRaw = props.getProperty("SUPABASE_DUAL_WRITE_ENABLED");
+  const enabled = enabledRaw == null
+    ? SUPABASE_DUAL_WRITE_ENABLED_DEFAULT
+    : String(enabledRaw).toLowerCase() === "true";
+
+  if (!enabled) {
+    return { enabled: false, reason: "disabled" };
+  }
+
+  const urlRaw = String(props.getProperty("SUPABASE_URL") || "").trim();
+  const keyRaw = String(
+    props.getProperty("SUPABASE_SERVICE_ROLE_KEY") ||
+    props.getProperty("SUPABASE_SECRET_KEY") ||
+    ""
+  ).trim();
+
+  if (!urlRaw || !keyRaw) {
+    return { enabled: false, reason: "missing_config" };
+  }
+
+  return {
+    enabled: true,
+    url: urlRaw.replace(/\/+$/, ""),
+    key: keyRaw
+  };
+}
+
+function writeSupabaseBestEffort_(merged, raw) {
+  const cfg = getSupabaseConfig_();
+  if (!cfg.enabled) {
+    return { enabled: false, ok: null, reason: cfg.reason };
+  }
+
+  const deviceId = String(merged.device_id || "");
+  if (!deviceId) {
+    return { enabled: true, ok: false, error: "missing_device_id" };
+  }
+
+  let eventRaw = null;
+  try {
+    eventRaw = JSON.parse(raw);
+  } catch (ignored) {
+    eventRaw = { raw: String(raw || "") };
+  }
+
+  const payload = {
+    ts: merged.timestamp_iso,
+    device_id: deviceId,
+    weight_kg: merged.weight_kg,
+    battery_v: merged.battery_v,
+    battery_pct: merged.battery_pct,
+    battery_charge_rate: merged.battery_charge_rate,
+    battery_connected: merged.battery_connected,
+    temperature_c: merged.temperature_c,
+    humidity_pct: merged.humidity_pct,
+    source: merged.source || "arduino-cloud",
+    event_raw: eventRaw
+  };
+
+  const latestPayload = {
+    device_id: deviceId,
+    ts: merged.timestamp_iso,
+    weight_kg: merged.weight_kg,
+    battery_v: merged.battery_v,
+    battery_pct: merged.battery_pct,
+    battery_charge_rate: merged.battery_charge_rate,
+    battery_connected: merged.battery_connected,
+    temperature_c: merged.temperature_c,
+    humidity_pct: merged.humidity_pct,
+    source: merged.source || "arduino-cloud",
+    event_raw: eventRaw
+  };
+
+  const baseHeaders = {
+    apikey: cfg.key,
+    Authorization: "Bearer " + cfg.key,
+    Prefer: "return=minimal",
+    "User-Agent": "the-hive-appscript/1.0",
+    "X-Client-Info": "the-hive-appscript/1.0"
+  };
+
+  const options = {
+    method: "post",
+    contentType: "application/json",
+    muteHttpExceptions: true,
+    headers: baseHeaders,
+    payload: JSON.stringify(payload)
+  };
+
+  try {
+    const latestRow = getSupabaseLatestRawRow_(cfg, deviceId);
+    let res;
+    let action = "inserted";
+
+    if (latestRow && shouldDedupeSupabaseRow_(latestRow.ts, merged.timestamp_iso, deviceId, latestRow.device_id)) {
+      res = UrlFetchApp.fetch(
+        cfg.url + "/rest/v1/telemetry_raw?id=eq." + encodeURIComponent(String(latestRow.id)),
+        {
+          method: "patch",
+          contentType: "application/json",
+          muteHttpExceptions: true,
+          headers: baseHeaders,
+          payload: JSON.stringify(payload)
+        }
+      );
+      action = "updated";
+    } else {
+      res = UrlFetchApp.fetch(cfg.url + "/rest/v1/telemetry_raw", options);
+    }
+
+    const code = Number(res.getResponseCode());
+    if (code >= 200 && code < 300) {
+      const latestRes = upsertSupabaseLatest_(cfg, latestPayload, baseHeaders);
+      if (latestRes.ok) {
+        return { enabled: true, ok: true, status: code, action: action };
+      }
+
+      return {
+        enabled: true,
+        ok: false,
+        status: code,
+        action: action,
+        error: latestRes.error || "telemetry_latest upsert failed"
+      };
+    }
+
+    const body = String(res.getContentText() || "");
+    Logger.log("Supabase dual-write failed (%s): %s", code, body);
+    return {
+      enabled: true,
+      ok: false,
+      status: code,
+      error: body.slice(0, 300)
+    };
+  } catch (err) {
+    Logger.log("Supabase dual-write exception: %s", String(err));
+    return {
+      enabled: true,
+      ok: false,
+      error: String(err)
+    };
+  }
+}
+
+function getSupabaseLatestRawRow_(cfg, deviceId) {
+  const url = cfg.url
+    + "/rest/v1/telemetry_raw?select=id,ts,device_id"
+    + "&device_id=eq." + encodeURIComponent(deviceId)
+    + "&order=ts.desc&id.desc&limit=1";
+
+  const res = UrlFetchApp.fetch(url, {
+    method: "get",
+    muteHttpExceptions: true,
+    headers: {
+      apikey: cfg.key,
+      Authorization: "Bearer " + cfg.key,
+      "User-Agent": "the-hive-appscript/1.0",
+      "X-Client-Info": "the-hive-appscript/1.0"
+    }
+  });
+
+  const code = Number(res.getResponseCode());
+  if (code < 200 || code >= 300) return null;
+
+  const rows = JSON.parse(String(res.getContentText() || "[]"));
+  return Array.isArray(rows) && rows.length ? rows[0] : null;
+}
+
+function shouldDedupeSupabaseRow_(latestTs, currentTs, currentDeviceId, latestDeviceId) {
+  if (!latestTs || !currentTs) return false;
+  if (String(currentDeviceId || "") === "") return false;
+  if (String(currentDeviceId || "") !== String(latestDeviceId || "")) return false;
+
+  const last = new Date(latestTs);
+  const current = new Date(currentTs);
+  if (isNaN(last.getTime()) || isNaN(current.getTime())) return false;
+
+  return Math.abs(current.getTime() - last.getTime()) <= DEDUPE_WINDOW_MS;
+}
+
+function upsertSupabaseLatest_(cfg, payload, headers) {
+  const res = UrlFetchApp.fetch(
+    cfg.url + "/rest/v1/telemetry_latest?on_conflict=device_id",
+    {
+      method: "post",
+      contentType: "application/json",
+      muteHttpExceptions: true,
+      headers: Object.assign({}, headers, {
+        Prefer: "resolution=merge-duplicates,return=minimal"
+      }),
+      payload: JSON.stringify(payload)
+    }
+  );
+
+  const code = Number(res.getResponseCode());
+  if (code >= 200 && code < 300) {
+    return { ok: true, status: code };
+  }
+
+  return {
+    ok: false,
+    status: code,
+    error: String(res.getContentText() || "").slice(0, 300)
+  };
+}
+
 // ── Debug helper (run from editor to test sheet access) ──────────────────────
 
 function testWrite() {
@@ -319,6 +637,57 @@ function testWrite() {
   Logger.log("Last row: " + sh.getLastRow());
   sh.appendRow(["TEST", "debug", 99, 4.2, 100, 0.5, true, 24.5, 55.0, "test", "debug-payload"]);
   Logger.log("Row appended!");
+}
+
+function authorizeSupabaseDualWrite() {
+  // Run once from Apps Script editor to grant script.external_request scope.
+  const res = UrlFetchApp.fetch("https://www.googleapis.com/generate_204", {
+    muteHttpExceptions: true
+  });
+  return {
+    ok: true,
+    status: res.getResponseCode(),
+    dualWrite: getSupabaseDualWriteConfigStatus()
+  };
+}
+
+function setSupabaseDualWriteConfig(url, key, enabled) {
+  const props = PropertiesService.getScriptProperties();
+
+  if (url != null) props.setProperty("SUPABASE_URL", String(url).trim());
+  if (key != null) props.setProperty("SUPABASE_SECRET_KEY", String(key).trim());
+  if (enabled != null) props.setProperty("SUPABASE_DUAL_WRITE_ENABLED", String(Boolean(enabled)));
+
+  return getSupabaseDualWriteConfigStatus();
+}
+
+// Helper for CLI callers that struggle with JSON array quoting in shell wrappers.
+// packed format: <url>|<key>|<enabled>
+function setSupabaseDualWriteConfigPacked(packed) {
+  const text = String(packed || "");
+  const parts = text.split("|");
+  const url = parts.length > 0 ? parts[0] : null;
+  const key = parts.length > 1 ? parts[1] : null;
+  const enabled = parts.length > 2 ? String(parts[2]).toLowerCase() === "true" : null;
+  return setSupabaseDualWriteConfig(url, key, enabled);
+}
+
+function getSupabaseDualWriteConfigStatus() {
+  const props = PropertiesService.getScriptProperties();
+  const url = String(props.getProperty("SUPABASE_URL") || "");
+  const key = String(
+    props.getProperty("SUPABASE_SERVICE_ROLE_KEY") ||
+    props.getProperty("SUPABASE_SECRET_KEY") ||
+    ""
+  );
+  const enabledRaw = props.getProperty("SUPABASE_DUAL_WRITE_ENABLED");
+
+  return {
+    enabled: enabledRaw == null ? SUPABASE_DUAL_WRITE_ENABLED_DEFAULT : String(enabledRaw).toLowerCase() === "true",
+    url_set: Boolean(url),
+    key_set: Boolean(key),
+    key_preview: key ? (key.slice(0, 6) + "..." + key.slice(-4)) : ""
+  };
 }
 
 // ── Utilities ────────────────────────────────────────────────────────────────

@@ -156,6 +156,91 @@ Notes:
 3. GitHub Pages updates from branch root.
 4. Site URL: `https://sjs329.github.io/hive-monitor/`
 
+## 4) Supabase Pilot (Alternative to Apps Script + Sheets)
+
+Use this for faster reads and longer retention on free-tier Postgres.
+
+### One-time setup
+
+1. In Supabase SQL Editor, run:
+
+```sql
+-- file: supabase/schema.sql
+```
+
+2. Set environment variables in PowerShell:
+
+```powershell
+$env:SUPABASE_URL = "https://<project-ref>.supabase.co"
+$env:SUPABASE_SECRET_KEY = "<api-secret-key>"
+```
+
+3. Run smoke test:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/supabase_smoke_test.ps1
+```
+
+### API contract for dashboard
+
+- Latest rows (overview):
+
+```http
+POST /rest/v1/rpc/get_latest
+Content-Type: application/json
+
+{ "p_device_ids": ["<device-id>"] }
+```
+
+- Time series (detail page):
+
+```http
+POST /rest/v1/rpc/get_series
+Content-Type: application/json
+
+{
+  "p_device_id": "<device-id>",
+  "p_hours": 24,
+  "p_bucket_minutes": 5
+}
+```
+
+Notes:
+- Ingestion writes go to `telemetry_raw`; trigger keeps `telemetry_latest` current.
+- Reads are allowed for anon/authenticated by RLS policy.
+- Writes should use a secret API key (recommended), or a legacy service role key for backward compatibility. An Edge Function is preferred for production write paths.
+
+### Supabase read-test clone pages
+
+The repo now includes isolated test pages that read from Supabase and do not change current Apps Script pages:
+
+- `index-supabase.html`
+- `hive-supabase.html`
+
+Setup:
+
+1. Set `SUPABASE_ANON_KEY` in `hives-supabase.js`.
+2. Open `index-supabase.html`.
+3. Verify cards load and detail links open `hive-supabase.html`.
+
+These clones keep the existing UI/behavior while changing only the data source.
+
+### Optional dual-write (Apps Script -> Sheets + Supabase)
+
+To compare pipelines without changing existing dashboard behavior, Apps Script can now write to both targets.
+
+Set these Script Properties in Apps Script:
+
+- `SUPABASE_DUAL_WRITE_ENABLED = true`
+- `SUPABASE_URL = https://<project-ref>.supabase.co`
+- `SUPABASE_SECRET_KEY = <api-secret-key>`
+
+Notes:
+
+- Sheets write remains primary; Supabase write is best-effort.
+- If Supabase fails, webhook still returns success for Sheets ingestion.
+- Set `SUPABASE_DUAL_WRITE_ENABLED = false` to disable dual-write instantly.
+
 ## Apps Script Behavior Summary
 
 `doPost`:

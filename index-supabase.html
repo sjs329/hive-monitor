@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>The Hive — Overview</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <img class="logo logo-image" src="bee-logo.svg" alt="The Hive logo" />
+      <div>
+        <h1>The Hive</h1>
+        <p class="subtitle">Beehive Monitor</p>
+      </div>
+      <div class="header-meta">
+        <span id="last-updated">—</span>
+        <button id="refresh-btn" onclick="refreshOverview()">↻ Refresh</button>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div id="error-banner" class="error-banner hidden"></div>
+    <div id="hive-grid" class="hive-grid">
+      <!-- Cards injected by overview.js -->
+    </div>
+  </main>
+
+  <footer>
+    <span>Test Mode: Data via Supabase</span>
+  </footer>
+
+  <script src="hives-supabase.js"></script>
+  <script src="overview-supabase.js"></script>
+</body>
+</html>
