@@ -629,6 +629,137 @@ function upsertSupabaseLatest_(cfg, payload, headers) {
   };
 }
 
+// ── One-time Sheet → Supabase backfill ───────────────────────────────────────
+
+/**
+ * Copies every row in the Google Sheet into Supabase telemetry_raw.
+ * Rows that already exist (same device_id + ts) are silently skipped thanks to
+ * the UNIQUE (device_id, ts) constraint and ON CONFLICT DO NOTHING.
+ *
+ * Run once from the Apps Script editor (Function: backfillSheetDataToSupabase).
+ * Check View → Logs for progress and a final summary.
+ */
+function backfillSheetDataToSupabase() {
+  const BATCH_SIZE = 200;
+
+  const cfg = getSupabaseConfig_();
+  if (!cfg.enabled) {
+    Logger.log("Supabase not enabled. Set SUPABASE_DUAL_WRITE_ENABLED=true first.");
+    return { ok: false, error: "not_enabled" };
+  }
+
+  const sh = getOrCreateSheet_();
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) {
+    Logger.log("Sheet has no data rows — nothing to backfill.");
+    return { ok: true, total: 0, batches_ok: 0, batches_err: 0 };
+  }
+
+  const numRows = lastRow - 1; // header is row 1
+  Logger.log("Reading %s rows from sheet…", numRows);
+  const values = sh.getRange(2, 1, numRows, 11).getValues();
+
+  const baseHeaders = {
+    apikey: cfg.key,
+    Authorization: "Bearer " + cfg.key,
+    // ON CONFLICT (device_id, ts) DO NOTHING — skips duplicates silently
+    Prefer: "resolution=ignore-duplicates,return=minimal",
+    "User-Agent": "the-hive-appscript/1.0",
+    "X-Client-Info": "the-hive-appscript/1.0"
+  };
+
+  let totalPayloads = 0;
+  let batchesOk = 0;
+  let batchesErr = 0;
+
+  for (let start = 0; start < values.length; start += BATCH_SIZE) {
+    const batch = values.slice(start, start + BATCH_SIZE);
+
+    const payloads = [];
+    for (const r of batch) {
+      // timestamp_iso (col A) — Sheets may return a Date object or an ISO string
+      const tsRaw = r[0];
+      if (!tsRaw) continue; // skip blank rows
+      let tsIso;
+      if (tsRaw instanceof Date) {
+        if (isNaN(tsRaw.getTime())) continue;
+        tsIso = tsRaw.toISOString();
+      } else {
+        const s = String(tsRaw).trim();
+        if (!s) continue;
+        const d = new Date(s);
+        tsIso = isNaN(d.getTime()) ? s : d.toISOString();
+      }
+
+      const deviceId = String(r[1] || "").trim();
+      if (!deviceId) continue;
+
+      // event_raw (col K) is stored as a JSON string in Sheets
+      let eventRaw = null;
+      try {
+        const rawStr = String(r[10] || "").trim();
+        eventRaw = rawStr ? JSON.parse(rawStr) : null;
+      } catch (ignored) {
+        eventRaw = r[10] ? { raw: String(r[10]).slice(0, 1000) } : null;
+      }
+
+      payloads.push({
+        ts: tsIso,
+        device_id: deviceId,
+        weight_kg: toNumOrNull_(r[2]),
+        battery_v: toNumOrNull_(r[3]),
+        battery_pct: toNumOrNull_(r[4]),
+        battery_charge_rate: toNumOrNull_(r[5]),
+        battery_connected: r[6] === "" ? null : Boolean(r[6]),
+        temperature_c: toNumOrNull_(r[7]),
+        humidity_pct: toNumOrNull_(r[8]),
+        source: String(r[9] || "arduino-cloud") || "arduino-cloud",
+        event_raw: eventRaw
+      });
+    }
+
+    if (!payloads.length) continue;
+    totalPayloads += payloads.length;
+
+    const res = UrlFetchApp.fetch(
+      cfg.url + "/rest/v1/telemetry_raw?on_conflict=device_id,ts",
+      {
+        method: "post",
+        contentType: "application/json",
+        muteHttpExceptions: true,
+        headers: baseHeaders,
+        payload: JSON.stringify(payloads)
+      }
+    );
+
+    const code = Number(res.getResponseCode());
+    if (code >= 200 && code < 300) {
+      batchesOk++;
+      Logger.log(
+        "Batch %s–%s / %s: OK (HTTP %s)",
+        start + 1, start + payloads.length, numRows, code
+      );
+    } else {
+      batchesErr++;
+      Logger.log(
+        "Batch %s–%s: ERROR HTTP %s — %s",
+        start + 1, start + payloads.length,
+        code, String(res.getContentText() || "").slice(0, 500)
+      );
+    }
+  }
+
+  const result = {
+    ok: batchesErr === 0,
+    sheet_rows: numRows,
+    payloads_sent: totalPayloads,
+    batches_ok: batchesOk,
+    batches_err: batchesErr
+  };
+  Logger.log("Backfill complete: %s", JSON.stringify(result));
+  return result;
+}
+
 // ── Debug helper (run from editor to test sheet access) ──────────────────────
 
 function testWrite() {

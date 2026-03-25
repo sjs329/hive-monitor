@@ -26,6 +26,10 @@ document.title = `The Hive — ${hiveCfg.label}`;
 let allRows = [];
 let activeHours = 24;
 let refreshTimer = null;
+let refreshSeq = 0;
+let historyLoadSeq = 0;
+let hasCompleteHistory = false;
+let isHistoryLoading = false;
 
 const SHUTDOWN_PCT = 2;
 const MIN_RATE_FOR_ETA = 0.05;
@@ -57,34 +61,153 @@ const PLOTLY_LAYOUT_BASE = {
 // ─────────────────────────────────────────────────────────────────────────────
 // Data fetching
 // ─────────────────────────────────────────────────────────────────────────────
-async function fetchData() {
+function supabaseAuthHeaders() {
+  return {
+    apikey: SUPABASE_ANON_KEY,
+    Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+  };
+}
+
+function mapSupabaseRows(rows) {
+  return (rows || []).map(r => ({
+    ...r,
+    timestamp_iso: r.ts,
+    ts: new Date(r.ts),
+  }));
+}
+
+function normalizeRowsForCharts(rows) {
+  const filtered = deviceId ? rows.filter(r => r.device_id === deviceId) : rows;
+  return filtered.reverse();
+}
+
+function getRangeCutoff(hours) {
+  if (!hours) return null;
+  return new Date(Date.now() - hours * 3600 * 1000);
+}
+
+function formatHistoryTs(ts) {
+  if (!(ts instanceof Date) || Number.isNaN(ts.getTime())) return "unknown";
+  return ts.toLocaleString();
+}
+
+function getRangeLabel(hours) {
+  if (!hours) return "All";
+  if (hours === 24) return "24h";
+  if (hours === 72) return "3d";
+  if (hours === 168) return "7d";
+  if (hours === 720) return "30d";
+  return `${hours}h`;
+}
+
+function updateHistoryLoadStatus() {
+  const el = document.getElementById("history-load-status");
+  if (!el) return;
+
+  if (!allRows.length) {
+    el.textContent = isHistoryLoading ? "History: loading..." : "History: no data";
+    return;
+  }
+
+  const oldest = allRows[0]?.ts;
+  const oldestText = formatHistoryTs(oldest);
+  const rangeLabel = getRangeLabel(activeHours);
+
+  if (isHistoryLoading) {
+    el.textContent = `History (${rangeLabel}): loading older data... oldest ${oldestText}`;
+    return;
+  }
+
+  const stillNeeds = needsMoreHistory(activeHours);
+  if (stillNeeds) {
+    el.textContent = `History (${rangeLabel}): partial, oldest ${oldestText}`;
+    return;
+  }
+
+  if (hasCompleteHistory) {
+    el.textContent = `History (${rangeLabel}): complete, oldest ${oldestText}`;
+    return;
+  }
+
+  el.textContent = `History (${rangeLabel}): range covered, oldest ${oldestText}`;
+}
+
+function needsMoreHistory(hours) {
+  if (hasCompleteHistory) return false;
+  if (!allRows.length) return false;
+  if (!hours) return true;
+
+  const cutoff = getRangeCutoff(hours);
+  const oldest = allRows[0]?.ts;
+  if (!(cutoff instanceof Date) || Number.isNaN(cutoff.getTime())) return true;
+  if (!(oldest instanceof Date) || Number.isNaN(oldest.getTime())) return true;
+  return oldest > cutoff;
+}
+
+async function fetchTelemetryPage(limit, beforeTsIso = null) {
   if (!SUPABASE_ANON_KEY) {
     throw new Error("Missing SUPABASE_ANON_KEY in hives-supabase.js");
   }
 
   const query = new URLSearchParams({
     select: "ts,device_id,weight_kg,battery_v,battery_pct,battery_charge_rate,battery_connected,temperature_c,humidity_pct,source",
-    order: "ts.asc",
-    limit: String(FETCH_LIMIT),
+    order: "ts.desc",
+    limit: String(limit),
   });
   if (deviceId) query.set("device_id", `eq.${deviceId}`);
+  if (beforeTsIso) query.set("ts", `lt.${beforeTsIso}`);
 
   const url = `${SUPABASE_URL.replace(/\/$/, "")}/rest/v1/telemetry_raw?${query.toString()}`;
   const res = await fetch(url, {
     cache: "no-store",
-    headers: {
-      apikey: SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-    },
+    headers: supabaseAuthHeaders(),
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const rows = (await res.json() || []).map(r => ({
-    ...r,
-    timestamp_iso: r.ts,
-    ts: new Date(r.ts),
-  }));
-  // Filter to the hive shown on this page
-  return deviceId ? rows.filter(r => r.device_id === deviceId) : rows;
+  return mapSupabaseRows(await res.json());
+}
+
+function applyCurrentView() {
+  const filtered = filterByHours(allRows, activeHours);
+  updateStats(filtered, allRows);
+  renderAll(filtered);
+  updateHistoryLoadStatus();
+}
+
+async function loadMoreHistoryInBackground(seq) {
+  if (!needsMoreHistory(activeHours)) return;
+  historyLoadSeq = seq;
+  isHistoryLoading = true;
+  updateHistoryLoadStatus();
+
+  let beforeTsIso = allRows[0]?.timestamp_iso || null;
+  if (!beforeTsIso) return;
+
+  const MAX_BATCHES_PER_PASS = 100;
+  let batches = 0;
+
+  try {
+    while (seq === refreshSeq && seq === historyLoadSeq && needsMoreHistory(activeHours) && batches < MAX_BATCHES_PER_PASS) {
+      const pageDesc = await fetchTelemetryPage(FETCH_LIMIT, beforeTsIso);
+      batches += 1;
+
+      if (!pageDesc.length) {
+        hasCompleteHistory = true;
+        break;
+      }
+
+      const pageAsc = normalizeRowsForCharts(pageDesc);
+      allRows = pageAsc.concat(allRows);
+      beforeTsIso = allRows[0]?.timestamp_iso || null;
+
+      // Repaint as history arrives so "All" and multi-day ranges expand in-place.
+      applyCurrentView();
+    }
+  } finally {
+    if (seq === refreshSeq && seq === historyLoadSeq) {
+      isHistoryLoading = false;
+      updateHistoryLoadStatus();
+    }
+  }
 }
 
 function filterByHours(rows, hours) {
@@ -542,9 +665,16 @@ document.querySelectorAll(".range-btn").forEach(btn => {
     document.querySelectorAll(".range-btn").forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     activeHours = Number(btn.dataset.hours);
-    const filtered = filterByHours(allRows, activeHours);
-    updateStats(filtered, allRows);
-    renderAll(filtered);
+    applyCurrentView();
+
+    // If the newly selected range needs older points, continue paginating in background.
+    loadMoreHistoryInBackground(refreshSeq).catch(err => {
+      isHistoryLoading = false;
+      updateHistoryLoadStatus();
+      const errBanner = document.getElementById("error-banner");
+      errBanner.textContent = "Background history load failed: " + err.message;
+      errBanner.classList.remove("hidden");
+    });
   });
 });
 
@@ -556,9 +686,21 @@ async function refresh() {
   const errBanner = document.getElementById("error-banner");
   btn.disabled = true;
   btn.textContent = "↻ Loading…";
+  const seq = ++refreshSeq;
 
   try {
-    allRows = await fetchData();
+    isHistoryLoading = false;
+    hasCompleteHistory = false;
+    updateHistoryLoadStatus();
+
+    const firstPageDesc = await fetchTelemetryPage(FETCH_LIMIT, null);
+    allRows = normalizeRowsForCharts(firstPageDesc);
+    if (!firstPageDesc.length) {
+      hasCompleteHistory = true;
+    }
+
+    if (seq !== refreshSeq) return;
+
     errBanner.classList.add("hidden");
 
     // Battery connection should not be shown as a normal stat; only warn on error.
@@ -568,13 +710,21 @@ async function refresh() {
       errBanner.classList.remove("hidden");
     }
 
-    const filtered = filterByHours(allRows, activeHours);
-    updateStats(filtered, allRows);
-    renderAll(filtered);
+    applyCurrentView();
+
+    loadMoreHistoryInBackground(seq).catch(err => {
+      if (seq !== refreshSeq) return;
+      isHistoryLoading = false;
+      updateHistoryLoadStatus();
+      errBanner.textContent = "Background history load failed: " + err.message;
+      errBanner.classList.remove("hidden");
+    });
 
     document.getElementById("last-updated").textContent =
       "Updated " + new Date().toLocaleTimeString();
   } catch (err) {
+    isHistoryLoading = false;
+    updateHistoryLoadStatus();
     errBanner.textContent = "Failed to load data: " + err.message;
     errBanner.classList.remove("hidden");
   } finally {
