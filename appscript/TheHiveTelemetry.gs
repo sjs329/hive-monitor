@@ -6,13 +6,21 @@ const DEDUPE_WINDOW_MS = 45000; // collapse burst updates from one wake cycle
 const GET_CACHE_SECONDS = 30;
 const MAX_CACHE_PAYLOAD_CHARS = 90000;
 const SUPABASE_DUAL_WRITE_ENABLED_DEFAULT = false;
+const WEBHOOK_SLOW_WARN_MS = 20000;
+const WEBHOOK_SAMPLE_LOG_RATE = 0.02; // 2% of all webhook calls
 
 // ── Webhook receiver (Arduino Cloud POST) ────────────────────────────────────
 
 function doPost(e) {
+  const startedAtMs = Date.now();
+  let lockAcquiredAtMs = startedAtMs;
+  let parseMergedDoneAtMs = startedAtMs;
+  let sheetWriteDoneAtMs = startedAtMs;
+
   const lock = LockService.getScriptLock();
   try {
     lock.waitLock(5000);
+    lockAcquiredAtMs = Date.now();
 
     if (!e || !e.postData || !e.postData.contents) {
       return json_({ ok: false, error: "Empty POST body" });
@@ -28,12 +36,50 @@ function doPost(e) {
 
     const parsed = parseArduinoPayload_(payload);
     const merged = mergeWithLastKnownState_(parsed);
+    parseMergedDoneAtMs = Date.now();
 
     const sh = getOrCreateSheet_();
     upsertTelemetryRow_(sh, merged, raw);
+    sheetWriteDoneAtMs = Date.now();
 
     // Optional migration path: write to Supabase too, without blocking Sheets writes.
     const supabase = writeSupabaseBestEffort_(merged, raw);
+
+    const finishedAtMs = Date.now();
+    const timing = {
+      total_ms: finishedAtMs - startedAtMs,
+      lock_wait_ms: lockAcquiredAtMs - startedAtMs,
+      parse_merge_ms: parseMergedDoneAtMs - lockAcquiredAtMs,
+      sheet_write_ms: sheetWriteDoneAtMs - parseMergedDoneAtMs,
+      supabase_ms: finishedAtMs - sheetWriteDoneAtMs
+    };
+
+    const isSlow = timing.total_ms >= WEBHOOK_SLOW_WARN_MS;
+    const isSupabaseError = Boolean(supabase && supabase.ok === false);
+    const isSampled = !isSlow && !isSupabaseError && Math.random() < WEBHOOK_SAMPLE_LOG_RATE;
+
+    if (isSlow || isSupabaseError || isSampled) {
+      const logReason = isSlow ? "slow" : (isSupabaseError ? "supabase_error" : "sampled");
+      const sbTimings = (supabase && supabase.timings_ms) || {};
+      Logger.log(
+        "doPost timing reason=%s device=%s total=%sms lock=%sms parse=%sms sheet=%sms supabase=%sms supabase_ok=%s supabase_action=%s supabase_status=%s supabase_error=%s sb_total=%s sb_latest_fetch=%s sb_raw_write=%s sb_latest_upsert=%s",
+        logReason,
+        String(merged.device_id || ""),
+        timing.total_ms,
+        timing.lock_wait_ms,
+        timing.parse_merge_ms,
+        timing.sheet_write_ms,
+        timing.supabase_ms,
+        String(supabase && supabase.ok),
+        String(supabase && supabase.action),
+        String(supabase && supabase.status),
+        String((supabase && supabase.error) || ""),
+        String(sbTimings.total),
+        String(sbTimings.latest_fetch),
+        String(sbTimings.raw_write),
+        String(sbTimings.latest_upsert)
+      );
+    }
 
     return json_({ ok: true, received: merged, supabase: supabase });
   } catch (err) {
@@ -451,6 +497,10 @@ function getSupabaseConfig_() {
 }
 
 function writeSupabaseBestEffort_(merged, raw) {
+  const startedAtMs = Date.now();
+  let latestFetchDoneAtMs = startedAtMs;
+  let rawWriteDoneAtMs = startedAtMs;
+
   const cfg = getSupabaseConfig_();
   if (!cfg.enabled) {
     return { enabled: false, ok: null, reason: cfg.reason };
@@ -514,6 +564,7 @@ function writeSupabaseBestEffort_(merged, raw) {
 
   try {
     const latestRow = getSupabaseLatestRawRow_(cfg, deviceId);
+    latestFetchDoneAtMs = Date.now();
     let res;
     let action = "inserted";
 
@@ -532,37 +583,71 @@ function writeSupabaseBestEffort_(merged, raw) {
     } else {
       res = UrlFetchApp.fetch(cfg.url + "/rest/v1/telemetry_raw", options);
     }
+    rawWriteDoneAtMs = Date.now();
 
     const code = Number(res.getResponseCode());
     if (code >= 200 && code < 300) {
       const latestRes = upsertSupabaseLatest_(cfg, latestPayload, baseHeaders);
       if (latestRes.ok) {
-        return { enabled: true, ok: true, status: code, action: action };
+        const finishedAtMs = Date.now();
+        return {
+          enabled: true,
+          ok: true,
+          status: code,
+          action: action,
+          timings_ms: {
+            total: finishedAtMs - startedAtMs,
+            latest_fetch: latestFetchDoneAtMs - startedAtMs,
+            raw_write: rawWriteDoneAtMs - latestFetchDoneAtMs,
+            latest_upsert: finishedAtMs - rawWriteDoneAtMs
+          }
+        };
       }
 
+      const finishedAtMs = Date.now();
       return {
         enabled: true,
         ok: false,
         status: code,
         action: action,
-        error: latestRes.error || "telemetry_latest upsert failed"
+        error: latestRes.error || "telemetry_latest upsert failed",
+        timings_ms: {
+          total: finishedAtMs - startedAtMs,
+          latest_fetch: latestFetchDoneAtMs - startedAtMs,
+          raw_write: rawWriteDoneAtMs - latestFetchDoneAtMs,
+          latest_upsert: finishedAtMs - rawWriteDoneAtMs
+        }
       };
     }
 
     const body = String(res.getContentText() || "");
     Logger.log("Supabase dual-write failed (%s): %s", code, body);
+    const finishedAtMs = Date.now();
     return {
       enabled: true,
       ok: false,
       status: code,
-      error: body.slice(0, 300)
+      error: body.slice(0, 300),
+      timings_ms: {
+        total: finishedAtMs - startedAtMs,
+        latest_fetch: latestFetchDoneAtMs - startedAtMs,
+        raw_write: rawWriteDoneAtMs - latestFetchDoneAtMs,
+        latest_upsert: finishedAtMs - rawWriteDoneAtMs
+      }
     };
   } catch (err) {
     Logger.log("Supabase dual-write exception: %s", String(err));
+    const finishedAtMs = Date.now();
     return {
       enabled: true,
       ok: false,
-      error: String(err)
+      error: String(err),
+      timings_ms: {
+        total: finishedAtMs - startedAtMs,
+        latest_fetch: latestFetchDoneAtMs - startedAtMs,
+        raw_write: rawWriteDoneAtMs - latestFetchDoneAtMs,
+        latest_upsert: finishedAtMs - rawWriteDoneAtMs
+      }
     };
   }
 }
