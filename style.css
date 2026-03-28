@@ -106,6 +106,15 @@ main {
   margin-bottom: 16px;
   font-size: 0.9rem;
 }
+.warning-banner {
+  background: #fff7e6;
+  border: 1px solid #f0d9a8;
+  color: #7a5a00;
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  font-size: 0.9rem;
+}
 .hidden { display: none !important; }
 
 /* ── Section labels ───────────────────────────── */

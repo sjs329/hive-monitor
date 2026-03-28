@@ -7,3 +7,6 @@ arduino-cloud-credentials.json
 
 # NPM stuff
 node_modules/
+
+# Supabase local CLI state
+supabase/.temp/

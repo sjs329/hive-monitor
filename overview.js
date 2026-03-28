@@ -2,6 +2,7 @@
 
 const OVERVIEW_CACHE_KEY = "overview_latest_cache_v1";
 const OVERVIEW_CACHE_MAX_AGE_MS = 10 * 60 * 1000;
+const LIVE_TIMEOUT_MS = 15 * 60 * 1000;
 
 async function fetchLatestPerDevice() {
   const deviceIds = HIVES_CONFIG
@@ -90,6 +91,9 @@ function renderHiveIcon(hive) {
 
 function buildCard(hive, latest) {
   const hasData = !!latest;
+  const isRecent = hasData && latest.ts instanceof Date && !Number.isNaN(latest.ts.getTime())
+    ? (Date.now() - latest.ts.getTime()) <= LIVE_TIMEOUT_MS
+    : false;
   const lastSeen = hasData
     ? latest.ts.toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" })
     : null;
@@ -124,7 +128,11 @@ function buildCard(hive, latest) {
           <div class="hc-title">${hive.label}</div>
           <div class="hc-location">${hive.location || ""}</div>
         </div>
-        ${hasData ? '<span class="hc-badge hc-badge--live">● Live</span>' : '<span class="hc-badge hc-badge--wait">No data</span>'}
+        ${!hasData
+          ? '<span class="hc-badge hc-badge--wait">No data</span>'
+          : isRecent
+            ? '<span class="hc-badge hc-badge--live">● Live</span>'
+            : '<span class="hc-badge hc-badge--wait">Stale</span>'}
       </div>
       <div class="hc-stats">
         ${statLine("Weight", weight, "kg")}
@@ -148,11 +156,42 @@ function renderOverviewGrid(byDevice) {
   }).join("");
 }
 
+function formatAge(ms) {
+  const totalMins = Math.max(0, Math.floor(ms / 60000));
+  const hours = Math.floor(totalMins / 60);
+  const mins = totalMins % 60;
+  if (hours > 0) return `${hours}h ${mins}m`;
+  return `${mins}m`;
+}
+
+function updateWebhookStaleBanner(byDevice) {
+  const banner = document.getElementById("webhook-stale-banner");
+  if (!banner) return;
+
+  const rows = Object.values(byDevice || {}).filter(r => r && r.ts instanceof Date && !Number.isNaN(r.ts.getTime()));
+  if (!rows.length) {
+    banner.classList.add("hidden");
+    return;
+  }
+
+  const newest = rows.reduce((best, row) => (row.ts > best.ts ? row : best), rows[0]);
+  const ageMs = Date.now() - newest.ts.getTime();
+
+  if (ageMs <= LIVE_TIMEOUT_MS) {
+    banner.classList.add("hidden");
+    return;
+  }
+
+  banner.textContent = `No new webhook posts for ${formatAge(ageMs)}. Latest reading: ${newest.ts.toLocaleString()}.`;
+  banner.classList.remove("hidden");
+}
+
 function renderCachedOverviewIfAvailable() {
   const cached = loadOverviewCache();
   if (!cached) return false;
 
   renderOverviewGrid(cached.byDevice);
+  updateWebhookStaleBanner(cached.byDevice);
   document.getElementById("last-updated").textContent =
     "Updated " + cached.fetchedAt.toLocaleTimeString() + " (cached)";
   return true;
@@ -169,6 +208,7 @@ async function refreshOverview() {
     errBanner.classList.add("hidden");
 
     renderOverviewGrid(byDevice);
+    updateWebhookStaleBanner(byDevice);
     saveOverviewCache(byDevice);
 
     document.getElementById("last-updated").textContent =
