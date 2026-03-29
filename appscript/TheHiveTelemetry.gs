@@ -8,6 +8,9 @@ const MAX_CACHE_PAYLOAD_CHARS = 90000;
 const SUPABASE_DUAL_WRITE_ENABLED_DEFAULT = false;
 const WEBHOOK_SLOW_WARN_MS = 20000;
 const WEBHOOK_SAMPLE_LOG_RATE = 0.02; // 2% of all webhook calls
+const HIVE_CONFIG_PROP_KEY = "HIVE_CONFIG_JSON";
+const HIVE_CONFIG_CACHE_KEY = "hive_config_cache_v1";
+const HIVE_CONFIG_ADMIN_PROP_KEY = "HIVE_CONFIG_ADMIN_KEY";
 
 // ── Webhook receiver (Arduino Cloud POST) ────────────────────────────────────
 
@@ -21,6 +24,11 @@ function doPost(e) {
   try {
     lock.waitLock(5000);
     lockAcquiredAtMs = Date.now();
+
+    const mode = (e.parameter && e.parameter.mode) ? String(e.parameter.mode) : "";
+    if (mode === "config_save") {
+      return handleConfigSaveRequest_(e);
+    }
 
     if (!e || !e.postData || !e.postData.contents) {
       return json_({ ok: false, error: "Empty POST body" });
@@ -104,8 +112,13 @@ function doGet(e) {
     const deviceId = (e.parameter && e.parameter.device_id) ? String(e.parameter.device_id) : "";
     const deviceIds = parseDeviceIds_(e.parameter && e.parameter.device_ids);
 
-    if (mode !== "data" && mode !== "latest" && mode !== "compare") {
+    if (mode !== "data" && mode !== "latest" && mode !== "compare" && mode !== "config_get") {
       return json_({ ok: false, error: "Unsupported mode" });
+    }
+
+    if (mode === "config_get") {
+      const rows = getHiveConfig_();
+      return json_({ ok: true, hives: rows });
     }
 
     if (mode === "compare") {
@@ -144,6 +157,208 @@ function doGet(e) {
   } catch (err) {
     return json_({ ok: false, error: String(err) });
   }
+}
+
+function handleConfigSaveRequest_(e) {
+  const payloadText = (e && e.postData && e.postData.contents) ? String(e.postData.contents) : "{}";
+  let payload;
+
+  try {
+    payload = JSON.parse(payloadText || "{}");
+  } catch (err) {
+    return json_({ ok: false, error: "Invalid JSON body" });
+  }
+
+  const rawRows = payload && Array.isArray(payload.hives) ? payload.hives : null;
+  if (!rawRows) {
+    return json_({ ok: false, error: "Missing hives array" });
+  }
+
+  const normalized = normalizeHiveConfigRows_(rawRows);
+  const saved = saveHiveConfig_(normalized);
+  return json_({ ok: true, hives: saved });
+}
+
+function getHiveConfig_() {
+  const cache = CacheService.getScriptCache();
+  try {
+    const cached = cache.get(HIVE_CONFIG_CACHE_KEY);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch (cacheErr) {
+    // Ignore cache failures and continue.
+  }
+
+  let rows = [];
+  const supabaseCfg = getSupabaseAdminConfig_();
+  if (supabaseCfg.enabled) {
+    rows = fetchHiveConfigFromSupabase_(supabaseCfg);
+  }
+
+  if (!rows.length) {
+    rows = fetchHiveConfigFromProperties_();
+  }
+
+  const normalized = normalizeHiveConfigRows_(rows);
+  try {
+    cache.put(HIVE_CONFIG_CACHE_KEY, JSON.stringify(normalized), GET_CACHE_SECONDS);
+  } catch (cacheErr) {
+    // Ignore cache write failures.
+  }
+  return normalized;
+}
+
+function saveHiveConfig_(rows) {
+  const normalized = normalizeHiveConfigRows_(rows);
+  const supabaseCfg = getSupabaseAdminConfig_();
+
+  if (supabaseCfg.enabled) {
+    try {
+      saveHiveConfigToSupabase_(supabaseCfg, normalized);
+    } catch (err) {
+      // Keep config writes available even if Supabase hive_config table is not ready yet.
+      Logger.log("Supabase hive_config save failed, using Script Properties fallback: %s", String(err));
+    }
+  }
+
+  PropertiesService.getScriptProperties().setProperty(HIVE_CONFIG_PROP_KEY, JSON.stringify(normalized));
+  try {
+    CacheService.getScriptCache().remove(HIVE_CONFIG_CACHE_KEY);
+  } catch (cacheErr) {
+    // Non-fatal.
+  }
+  return normalized;
+}
+
+function fetchHiveConfigFromProperties_() {
+  try {
+    const text = String(PropertiesService.getScriptProperties().getProperty(HIVE_CONFIG_PROP_KEY) || "").trim();
+    if (!text) return [];
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (err) {
+    return [];
+  }
+}
+
+function fetchHiveConfigFromSupabase_(cfg) {
+  const url = cfg.url
+    + "/rest/v1/hive_config?select=id,label,icon,device_id,active,location,sort_order"
+    + "&order=sort_order.asc,id.asc";
+
+  const res = UrlFetchApp.fetch(url, {
+    method: "get",
+    muteHttpExceptions: true,
+    headers: {
+      apikey: cfg.key,
+      Authorization: "Bearer " + cfg.key,
+      "User-Agent": "the-hive-appscript/1.0",
+      "X-Client-Info": "the-hive-appscript/1.0"
+    }
+  });
+
+  const code = Number(res.getResponseCode());
+  if (code < 200 || code >= 300) {
+    Logger.log("Supabase hive_config fetch failed (%s): %s", code, String(res.getContentText() || ""));
+    return [];
+  }
+
+  const parsed = JSON.parse(String(res.getContentText() || "[]"));
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+function saveHiveConfigToSupabase_(cfg, rows) {
+  const deleteRes = UrlFetchApp.fetch(cfg.url + "/rest/v1/hive_config?id=not.is.null", {
+    method: "delete",
+    muteHttpExceptions: true,
+    headers: {
+      apikey: cfg.key,
+      Authorization: "Bearer " + cfg.key,
+      Prefer: "return=minimal",
+      "User-Agent": "the-hive-appscript/1.0",
+      "X-Client-Info": "the-hive-appscript/1.0"
+    }
+  });
+
+  const deleteCode = Number(deleteRes.getResponseCode());
+  if (deleteCode < 200 || deleteCode >= 300) {
+    throw new Error("Failed to clear hive_config (HTTP " + deleteCode + ")");
+  }
+
+  const payload = rows.map((row, index) => ({
+    id: row.id,
+    label: row.label,
+    icon: row.icon,
+    device_id: row.device_id,
+    active: Boolean(row.active),
+    location: row.location,
+    sort_order: index + 1
+  }));
+
+  const insertRes = UrlFetchApp.fetch(cfg.url + "/rest/v1/hive_config", {
+    method: "post",
+    contentType: "application/json",
+    muteHttpExceptions: true,
+    headers: {
+      apikey: cfg.key,
+      Authorization: "Bearer " + cfg.key,
+      Prefer: "return=minimal",
+      "User-Agent": "the-hive-appscript/1.0",
+      "X-Client-Info": "the-hive-appscript/1.0"
+    },
+    payload: JSON.stringify(payload)
+  });
+
+  const insertCode = Number(insertRes.getResponseCode());
+  if (insertCode < 200 || insertCode >= 300) {
+    throw new Error("Failed to write hive_config (HTTP " + insertCode + "): " + String(insertRes.getContentText() || ""));
+  }
+}
+
+function normalizeHiveConfigRows_(rows) {
+  const fallback = [
+    { id: "pooh", label: "Pooh", icon: "icons/pooh.svg", device_id: "1e432d9f-0798-4578-9da1-31471c5ba848", active: true, location: "" },
+    { id: "piglet", label: "Piglet", icon: "icons/piglet.svg", device_id: null, active: false, location: "Coming soon" },
+    { id: "eeyore", label: "Eeyore", icon: "icons/eeyore.svg", device_id: null, active: false, location: "Coming soon" }
+  ];
+
+  const input = Array.isArray(rows) && rows.length ? rows : fallback;
+  const usedIds = {};
+  const usedDeviceIds = {};
+  const out = [];
+
+  input.forEach((row, idx) => {
+    const raw = row || {};
+    const label = String(raw.label || raw.id || ("Hive " + (idx + 1))).trim() || ("Hive " + (idx + 1));
+    const baseId = String(raw.id || label).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "hive";
+
+    let id = baseId;
+    let suffix = 2;
+    while (usedIds[id]) {
+      id = baseId + "-" + suffix;
+      suffix += 1;
+    }
+    usedIds[id] = true;
+
+    let deviceId = raw.device_id == null ? "" : String(raw.device_id).trim();
+    if (deviceId && usedDeviceIds[deviceId]) {
+      deviceId = "";
+    }
+    if (deviceId) usedDeviceIds[deviceId] = true;
+
+    out.push({
+      id: id,
+      label: label,
+      icon: String(raw.icon || "favicon.svg").trim() || "favicon.svg",
+      device_id: deviceId || null,
+      active: Boolean(raw.active) && Boolean(deviceId),
+      location: String(raw.location || "").trim()
+    });
+  });
+
+  return out;
 }
 
 function buildGetCacheKey_(mode, limit, scanLimit, deviceId, deviceIds) {
@@ -888,6 +1103,18 @@ function setSupabaseDualWriteConfigPacked(packed) {
   return setSupabaseDualWriteConfig(url, key, enabled);
 }
 
+function setHiveConfigAdminKey(key) {
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty(HIVE_CONFIG_ADMIN_PROP_KEY, String(key || "").trim());
+  return getSupabaseDualWriteConfigStatus();
+}
+
+function clearHiveConfigAdminKey() {
+  const props = PropertiesService.getScriptProperties();
+  props.deleteProperty(HIVE_CONFIG_ADMIN_PROP_KEY);
+  return getSupabaseDualWriteConfigStatus();
+}
+
 function getSupabaseDualWriteConfigStatus() {
   const props = PropertiesService.getScriptProperties();
   const url = String(props.getProperty("SUPABASE_URL") || "");
@@ -897,12 +1124,14 @@ function getSupabaseDualWriteConfigStatus() {
     ""
   );
   const enabledRaw = props.getProperty("SUPABASE_DUAL_WRITE_ENABLED");
+  const hiveConfigAdminKey = String(props.getProperty(HIVE_CONFIG_ADMIN_PROP_KEY) || "");
 
   return {
     enabled: enabledRaw == null ? SUPABASE_DUAL_WRITE_ENABLED_DEFAULT : String(enabledRaw).toLowerCase() === "true",
     url_set: Boolean(url),
     key_set: Boolean(key),
-    key_preview: key ? (key.slice(0, 6) + "..." + key.slice(-4)) : ""
+    key_preview: key ? (key.slice(0, 6) + "..." + key.slice(-4)) : "",
+    hive_config_admin_key_set: Boolean(hiveConfigAdminKey)
   };
 }
 
@@ -938,4 +1167,24 @@ function parseTimestamp_(p) {
   }
   const d = new Date(t);
   return isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
+}
+
+function getSupabaseAdminConfig_() {
+  const props = PropertiesService.getScriptProperties();
+  const urlRaw = String(props.getProperty("SUPABASE_URL") || "").trim();
+  const keyRaw = String(
+    props.getProperty("SUPABASE_SERVICE_ROLE_KEY") ||
+    props.getProperty("SUPABASE_SECRET_KEY") ||
+    ""
+  ).trim();
+
+  if (!urlRaw || !keyRaw) {
+    return { enabled: false, reason: "missing_config" };
+  }
+
+  return {
+    enabled: true,
+    url: urlRaw.replace(/\/+$/, ""),
+    key: keyRaw
+  };
 }

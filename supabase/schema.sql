@@ -40,6 +40,20 @@ create table if not exists public.telemetry_latest (
   updated_at timestamptz not null default now()
 );
 
+create table if not exists public.hive_config (
+  id text primary key,
+  label text not null,
+  icon text not null default 'favicon.svg',
+  device_id text unique,
+  active boolean not null default false,
+  location text not null default '',
+  sort_order integer not null default 0,
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists hive_config_sort_idx
+  on public.hive_config (sort_order asc, id asc);
+
 create or replace function public.upsert_latest_from_raw()
 returns trigger
 language plpgsql
@@ -189,6 +203,7 @@ $$;
 
 alter table public.telemetry_raw enable row level security;
 alter table public.telemetry_latest enable row level security;
+alter table public.hive_config enable row level security;
 
 -- Public dashboard reads (anon/authenticated) are allowed.
 drop policy if exists telemetry_raw_read on public.telemetry_raw;
@@ -200,6 +215,12 @@ using (true);
 drop policy if exists telemetry_latest_read on public.telemetry_latest;
 create policy telemetry_latest_read
 on public.telemetry_latest
+for select
+using (true);
+
+drop policy if exists hive_config_read on public.hive_config;
+create policy hive_config_read
+on public.hive_config
 for select
 using (true);
 

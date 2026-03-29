@@ -168,6 +168,8 @@ Use this for faster reads and longer retention on free-tier Postgres.
 -- file: supabase/schema.sql
 ```
 
+The schema now includes `public.hive_config` for persistent hive names/icons/device mapping.
+
 2. Set environment variables in PowerShell:
 
 ```powershell
@@ -210,20 +212,20 @@ Notes:
 - Reads are allowed for anon/authenticated by RLS policy.
 - Writes should use a secret API key (recommended), or a legacy service role key for backward compatibility. An Edge Function is preferred for production write paths.
 
-### Supabase read-test clone pages
+### Unified frontend files
 
-The repo now includes isolated test pages that read from Supabase and do not change current Apps Script pages:
+Dashboard frontend is now consolidated to one script set:
 
-- `index-supabase.html`
-- `hive-supabase.html`
+- `hives.js` (shared config)
+- `overview.js` (overview page logic)
+- `dashboard.js` (detail page logic)
 
-Setup:
+Both `index.html`/`hive.html` and compatibility pages (`index-supabase.html`/`hive-supabase.html`) use the same canonical scripts.
 
-1. Set `SUPABASE_ANON_KEY` in `hives-supabase.js`.
-2. Open `index-supabase.html`.
-3. Verify cards load and detail links open `hive-supabase.html`.
+Set `DATA_SOURCE` in `hives.js`:
 
-These clones keep the existing UI/behavior while changing only the data source.
+- `"supabase"` for direct Supabase reads (default)
+- `"appscript"` for Apps Script GET API reads
 
 ### Optional dual-write (Apps Script -> Sheets + Supabase)
 
@@ -240,6 +242,23 @@ Notes:
 - Sheets write remains primary; Supabase write is best-effort.
 - If Supabase fails, webhook still returns success for Sheets ingestion.
 - Set `SUPABASE_DUAL_WRITE_ENABLED = false` to disable dual-write instantly.
+
+### Server-side hive configuration
+
+Hive configuration edit mode now persists to server-side storage through Apps Script:
+
+- `GET /exec?mode=config_get` returns current hive config (public read)
+- `POST /exec?mode=config_save` saves hive config (currently open write)
+
+Storage behavior:
+
+- Primary: `public.hive_config` in Supabase
+- Fallback copy: Apps Script property `HIVE_CONFIG_JSON`
+
+Required Script Properties:
+
+- `SUPABASE_URL = https://<project-ref>.supabase.co`
+- `SUPABASE_SERVICE_ROLE_KEY` or `SUPABASE_SECRET_KEY = <api-secret-key>`
 
 ## Apps Script Behavior Summary
 

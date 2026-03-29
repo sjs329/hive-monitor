@@ -17,6 +17,7 @@
       </div>
       <div class="header-meta">
         <span id="last-updated">—</span>
+        <button id="edit-hives-btn" class="btn-secondary" type="button" aria-expanded="false">Edit Hives</button>
         <button id="refresh-btn" onclick="refreshOverview()">↻ Refresh</button>
       </div>
     </div>
@@ -25,6 +26,23 @@
   <main>
     <div id="error-banner" class="error-banner hidden"></div>
     <div id="webhook-stale-banner" class="warning-banner hidden"></div>
+
+    <section id="hive-config-panel" class="config-panel hidden" aria-live="polite">
+      <div class="config-panel-header">
+        <h2>Hive Configuration</h2>
+        <div class="config-panel-actions">
+          <button id="add-hive-btn" type="button" class="config-btn">+ Add Hive</button>
+          <button id="save-hive-config-btn" type="button" class="config-btn config-btn--primary">Save</button>
+          <button id="cancel-hive-config-btn" type="button" class="config-btn">Close</button>
+          <button id="reset-hive-config-btn" type="button" class="config-btn config-btn--danger">Reset Defaults</button>
+        </div>
+      </div>
+      <p class="config-help">Configure hive names, icons, active state, and device IDs for telemetry mapping.</p>
+      <div id="hive-config-error" class="error-banner hidden"></div>
+      <datalist id="hive-icon-options"></datalist>
+      <div id="hive-config-list" class="hive-config-list"></div>
+    </section>
+
     <div id="hive-grid" class="hive-grid">
       <!-- Cards injected by overview.js -->
     </div>
@@ -34,7 +52,9 @@
     <span>Test Mode: Data via Supabase</span>
   </footer>
 
-  <script src="hives-supabase.js"></script>
-  <script src="overview-supabase.js"></script>
+  <script src="hives.js"></script>
+  <script src="hive-config-store.js"></script>
+  <script src="hive-config-ui.js"></script>
+  <script src="overview.js"></script>
 </body>
 </html>

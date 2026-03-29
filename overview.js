@@ -1,21 +1,63 @@
 // overview.js — landing page logic
 
-const OVERVIEW_CACHE_KEY = "overview_latest_cache_v1";
-const OVERVIEW_CACHE_MAX_AGE_MS = 10 * 60 * 1000;
 const LIVE_TIMEOUT_MS = 15 * 60 * 1000;
 
-async function fetchLatestPerDevice() {
-  const deviceIds = HIVES_CONFIG
-    .map(hive => hive.device_id)
-    .filter(Boolean)
-    .join(",");
-  const url = `${API_URL}?mode=latest&device_ids=${encodeURIComponent(deviceIds)}&scan_limit=500`;
-  const res = await fetch(url, { cache: "default" });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const json = await res.json();
-  if (!json.ok) throw new Error(json.error || "API returned ok:false");
+function getHivesConfig_() {
+  if (typeof getConfiguredHives === "function") return getConfiguredHives();
+  return Array.isArray(HIVES_CONFIG) ? HIVES_CONFIG : [];
+}
 
-  const rows = (json.rows || []).map(r => ({ ...r, ts: new Date(r.timestamp_iso) }));
+async function ensureConfiguredHivesLoaded_() {
+  if (typeof loadConfiguredHives === "function") {
+    try {
+      await loadConfiguredHives(false);
+    } catch (err) {
+      // Keep running with the last loaded/default config if server config is temporarily unavailable.
+    }
+  }
+  configuredHives = getHivesConfig_();
+}
+
+let configuredHives = getHivesConfig_();
+let lastByDevice = {};
+
+async function fetchLatestPerDevice() {
+  const useSupabase = DATA_SOURCE !== "appscript";
+  let rows = [];
+
+  if (useSupabase) {
+    if (!SUPABASE_ANON_KEY) {
+      throw new Error("Missing SUPABASE_ANON_KEY in hives.js");
+    }
+
+    const deviceIds = configuredHives
+      .map(hive => hive.device_id)
+      .filter(Boolean);
+    const url = `${SUPABASE_URL.replace(/\/$/, "")}/rest/v1/rpc/get_latest`;
+    const res = await fetch(url, {
+      method: "POST",
+      cache: "no-store",
+      headers: {
+        "Content-Type": "application/json",
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      },
+      body: JSON.stringify({ p_device_ids: deviceIds }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    rows = (await res.json() || []).map(r => ({ ...r, ts: new Date(r.timestamp_iso) }));
+  } else {
+    const deviceIds = configuredHives
+      .map(hive => hive.device_id)
+      .filter(Boolean)
+      .join(",");
+    const url = `${API_URL}?mode=latest&device_ids=${encodeURIComponent(deviceIds)}&scan_limit=500`;
+    const res = await fetch(url, { cache: "default" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    if (!json.ok) throw new Error(json.error || "API returned ok:false");
+    rows = (json.rows || []).map(r => ({ ...r, ts: new Date(r.timestamp_iso) }));
+  }
 
   // Group by device_id, keep only the latest row per device
   const byDevice = {};
@@ -26,49 +68,6 @@ async function fetchLatestPerDevice() {
     }
   }
   return byDevice;
-}
-
-function saveOverviewCache(byDevice) {
-  try {
-    const payload = {
-      fetchedAt: Date.now(),
-      rows: Object.values(byDevice).map(row => ({
-        ...row,
-        ts: row.ts instanceof Date ? row.ts.toISOString() : row.ts,
-      })),
-    };
-    localStorage.setItem(OVERVIEW_CACHE_KEY, JSON.stringify(payload));
-  } catch (err) {
-    // Non-fatal: cached render is a best-effort optimization.
-  }
-}
-
-function loadOverviewCache() {
-  try {
-    const raw = localStorage.getItem(OVERVIEW_CACHE_KEY);
-    if (!raw) return null;
-
-    const parsed = JSON.parse(raw);
-    if (!parsed || !Array.isArray(parsed.rows) || !Number.isFinite(parsed.fetchedAt)) return null;
-
-    const ageMs = Date.now() - parsed.fetchedAt;
-    if (ageMs > OVERVIEW_CACHE_MAX_AGE_MS) return null;
-
-    const byDevice = {};
-    parsed.rows.forEach(row => {
-      const ts = new Date(row.ts || row.timestamp_iso);
-      if (Number.isNaN(ts.getTime())) return;
-      const did = row.device_id || "__unknown__";
-      byDevice[did] = { ...row, ts };
-    });
-
-    return {
-      byDevice,
-      fetchedAt: new Date(parsed.fetchedAt),
-    };
-  } catch (err) {
-    return null;
-  }
 }
 
 function batteryColor(pct) {
@@ -83,13 +82,34 @@ function statLine(label, value, unit) {
   return `<div class="hc-stat"><span class="hc-stat-label">${label}</span><span class="hc-stat-value">${display}</span></div>`;
 }
 
+function escapeHtml_(text) {
+  return String(text || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function isImageIconValue_(icon) {
+  const value = String(icon || "").trim();
+  if (!value) return true;
+  return /[./\\]/.test(value) || /^(https?:|data:|blob:)/i.test(value);
+}
+
 function renderHiveIcon(hive) {
-  const src = hive.icon || "favicon.svg";
   const alt = `${hive.label} badge`;
-  return `<img class="badge-icon" src="${src}" alt="${alt}" />`;
+  const icon = String(hive.icon || "").trim();
+  if (!icon || isImageIconValue_(icon)) {
+    const src = icon || "favicon.svg";
+    return `<img class="badge-icon" src="${src}" alt="${alt}" />`;
+  }
+  return `<span class="badge-emoji" role="img" aria-label="${escapeHtml_(alt)}">${escapeHtml_(icon)}</span>`;
 }
 
 function buildCard(hive, latest) {
+  const isConfigured = Boolean(hive.device_id);
+  const isActive = Boolean(hive.active) && isConfigured;
   const hasData = !!latest;
   const isRecent = hasData && latest.ts instanceof Date && !Number.isNaN(latest.ts.getTime())
     ? (Date.now() - latest.ts.getTime()) <= LIVE_TIMEOUT_MS
@@ -105,7 +125,11 @@ function buildCard(hive, latest) {
   const temp   = hasData && latest.temperature_c != null ? latest.temperature_c.toFixed(1) : null;
   const hum    = hasData && latest.humidity_pct != null ? latest.humidity_pct.toFixed(1) : null;
 
-  if (!hive.active) {
+  if (!isActive) {
+    const statusText = hive.active && !isConfigured ? "Missing Device ID" : "Coming Soon";
+    const detailText = hive.active && !isConfigured
+      ? "Set a device id in Edit Hives to enable telemetry"
+      : "Sensor not yet installed";
     return `
       <div class="hive-card hive-card--inactive">
         <div class="hc-header">
@@ -114,9 +138,9 @@ function buildCard(hive, latest) {
             <div class="hc-title">${hive.label}</div>
             <div class="hc-location">${hive.location || ""}</div>
           </div>
-          <span class="hc-badge hc-badge--soon">Coming Soon</span>
+          <span class="hc-badge hc-badge--soon">${statusText}</span>
         </div>
-        <div class="hc-placeholder">Sensor not yet installed</div>
+        <div class="hc-placeholder">${detailText}</div>
       </div>`;
   }
 
@@ -150,10 +174,29 @@ function buildCard(hive, latest) {
 
 function renderOverviewGrid(byDevice) {
   const grid = document.getElementById("hive-grid");
-  grid.innerHTML = HIVES_CONFIG.map(hive => {
+  grid.innerHTML = configuredHives.map(hive => {
     const latest = hive.device_id ? byDevice[hive.device_id] : null;
     return buildCard(hive, latest || null);
   }).join("");
+}
+
+function renderOverviewLoading(message) {
+  const grid = document.getElementById("hive-grid");
+  if (!grid) return;
+  grid.innerHTML = `<div class="hive-grid-loading">${escapeHtml_(message || "Loading hives...")}</div>`;
+}
+
+function initOverviewConfigEditor() {
+  if (typeof initHiveConfigEditor !== "function") return;
+
+  initHiveConfigEditor({
+    onSave: (nextHives) => {
+      configuredHives = nextHives;
+      renderOverviewGrid(lastByDevice);
+      updateWebhookStaleBanner(lastByDevice);
+      refreshOverview();
+    },
+  });
 }
 
 function formatAge(ms) {
@@ -186,17 +229,6 @@ function updateWebhookStaleBanner(byDevice) {
   banner.classList.remove("hidden");
 }
 
-function renderCachedOverviewIfAvailable() {
-  const cached = loadOverviewCache();
-  if (!cached) return false;
-
-  renderOverviewGrid(cached.byDevice);
-  updateWebhookStaleBanner(cached.byDevice);
-  document.getElementById("last-updated").textContent =
-    "Updated " + cached.fetchedAt.toLocaleTimeString() + " (cached)";
-  return true;
-}
-
 async function refreshOverview() {
   const btn = document.getElementById("refresh-btn");
   const errBanner = document.getElementById("error-banner");
@@ -204,12 +236,16 @@ async function refreshOverview() {
   btn.textContent = "↻ Loading…";
 
   try {
+    if (!Object.keys(lastByDevice).length) {
+      renderOverviewLoading("Loading hives...");
+    }
+    await ensureConfiguredHivesLoaded_();
     const byDevice = await fetchLatestPerDevice();
+    lastByDevice = byDevice;
     errBanner.classList.add("hidden");
 
     renderOverviewGrid(byDevice);
     updateWebhookStaleBanner(byDevice);
-    saveOverviewCache(byDevice);
 
     document.getElementById("last-updated").textContent =
       "Updated " + new Date().toLocaleTimeString();
@@ -223,7 +259,8 @@ async function refreshOverview() {
 }
 
 // Auto-refresh
-renderCachedOverviewIfAvailable();
-refreshOverview().then(() => {
+initOverviewConfigEditor();
+renderOverviewLoading("Loading hives...");
+ensureConfiguredHivesLoaded_().then(() => refreshOverview()).then(() => {
   setInterval(refreshOverview, AUTO_REFRESH_MS);
 });

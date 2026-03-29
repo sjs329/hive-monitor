@@ -56,9 +56,23 @@ header {
   height: 2.5rem;
   display: block;
 }
+.badge-emoji {
+  width: 2.5rem;
+  height: 2.5rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.9rem;
+  line-height: 1;
+}
 .badge-icon--header {
   width: 2.4rem;
   height: 2.4rem;
+}
+.badge-emoji--header {
+  width: 2.4rem;
+  height: 2.4rem;
+  font-size: 2rem;
 }
 h1 { font-size: 1.4rem; font-weight: 700; }
 .subtitle { font-size: 0.82rem; color: var(--ink-mute); }
@@ -89,6 +103,18 @@ h1 { font-size: 1.4rem; font-weight: 700; }
 #refresh-btn:hover { opacity: .85; }
 #refresh-btn:disabled { opacity: .5; cursor: default; }
 
+.btn-secondary {
+  background: #f0e8d8;
+  color: var(--ink);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 0.84rem;
+  cursor: pointer;
+}
+
+.btn-secondary:hover { background: #eaddc5; }
+
 /* ── Main layout ─────────────────────────────── */
 main {
   max-width: 1200px;
@@ -117,6 +143,224 @@ main {
 }
 .hidden { display: none !important; }
 
+/* -- Hive config editor ---------------------------------------------------- */
+.config-panel {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.config-panel-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.config-panel-header h2 {
+  font-size: 1rem;
+  margin: 0;
+}
+
+.config-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.config-help {
+  margin-top: 8px;
+  margin-bottom: 12px;
+  color: var(--ink-mute);
+  font-size: 0.85rem;
+}
+
+.config-status {
+  margin-top: 10px;
+  margin-bottom: 12px;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 0.84rem;
+}
+
+.config-status--info {
+  background: #f6efe2;
+  border: 1px solid #e5d1ae;
+  color: #6c4c12;
+}
+
+.config-status--success {
+  background: #edf7ef;
+  border: 1px solid #b8d9bf;
+  color: #215a2e;
+}
+
+.config-btn {
+  border: 1px solid var(--border);
+  background: #faf7f2;
+  color: var(--ink);
+  border-radius: 8px;
+  padding: 6px 11px;
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+
+.config-btn:hover {
+  background: #f0e8d8;
+}
+
+.config-btn:disabled,
+.btn-secondary:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.config-btn--primary {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.config-btn--primary:hover { opacity: 0.88; }
+
+.config-btn--danger {
+  background: #fdf0ee;
+  color: var(--danger);
+  border-color: #f0b8b2;
+}
+
+.config-btn--ghost {
+  background: transparent;
+}
+
+.hive-config-list {
+  display: grid;
+  gap: 12px;
+}
+
+.hive-config-row {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #faf7f2;
+  padding: 12px;
+}
+
+.hive-config-row-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.hive-config-row-header h3 {
+  font-size: 0.92rem;
+  margin: 0;
+}
+
+.hive-config-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 10px;
+}
+
+.config-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.config-icon-mode-options {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  min-height: 34px;
+}
+
+.config-icon-section {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  background: #fff;
+}
+
+.config-icon-choice-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(150px, 1fr));
+  gap: 10px;
+}
+
+.config-icon-option {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  background: #faf7f2;
+}
+
+.config-icon-option input[data-field="icon_emoji"] {
+  max-width: 5.2rem;
+  font-size: 1.2rem;
+  text-align: center;
+}
+
+.config-icon-option--inactive {
+  opacity: 0.55;
+  background: #f1ede6;
+}
+
+.config-icon-mode-options label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.84rem;
+  color: var(--ink);
+}
+
+.config-field span {
+  font-size: 0.72rem;
+  color: var(--ink-mute);
+  text-transform: uppercase;
+  letter-spacing: .05em;
+}
+
+.config-field input[type="text"] {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+  color: var(--ink);
+  font-size: 0.86rem;
+  padding: 7px 9px;
+}
+
+.config-field input[type="text"]:focus {
+  outline: 2px solid rgba(200, 130, 10, 0.25);
+  border-color: var(--accent);
+}
+
+.config-field--wide {
+  grid-column: span 2;
+}
+
+.config-field--check {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  padding-top: 20px;
+}
+
+.config-field--check span {
+  font-size: 0.82rem;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--ink);
+}
+
 /* ── Section labels ───────────────────────────── */
 .section-label {
   font-size: 0.72rem;
@@ -129,6 +373,17 @@ main {
 .section-label--minor {
   color: var(--ink-mute);
   margin-top: 28px;
+}
+
+.hive-grid-loading {
+  grid-column: 1 / -1;
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+  background: #faf7f2;
+  color: var(--ink-mute);
+  padding: 22px;
+  text-align: center;
+  font-size: 0.95rem;
 }
 
 /* ── Stat cards ──────────────────────────────── */
@@ -407,4 +662,6 @@ footer {
   .header-meta { margin-left: 0; width: 100%; justify-content: space-between; }
   .stat-value { font-size: 1.5rem; }
   .hive-grid { grid-template-columns: 1fr; }
+  .config-field--wide { grid-column: span 1; }
+  .config-icon-choice-grid { grid-template-columns: 1fr; }
 }
