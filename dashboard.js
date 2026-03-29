@@ -133,48 +133,38 @@ function getRangeCutoff(hours) {
 
 function formatHistoryTs(ts) {
   if (!(ts instanceof Date) || Number.isNaN(ts.getTime())) return "unknown";
-  return ts.toLocaleString();
+
+  const now = new Date();
+  const isToday = ts.getFullYear() === now.getFullYear()
+    && ts.getMonth() === now.getMonth()
+    && ts.getDate() === now.getDate();
+
+  if (isToday) {
+    return ts.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  }
+
+  return ts.toLocaleString([], {
+    month: "numeric",
+    day: "numeric",
+    year: "2-digit",
+    hour: "numeric",
+    minute: "2-digit",
+  });
 }
 
-function getRangeLabel(hours) {
-  if (!hours) return "All";
-  if (hours === 24) return "24h";
-  if (hours === 72) return "3d";
-  if (hours === 168) return "7d";
-  if (hours === 720) return "30d";
-  return `${hours}h`;
-}
-
-function updateHistoryLoadStatus() {
-  const el = document.getElementById("history-load-status");
-  if (!el) return;
+function updateHeaderTimes_() {
+  const newestEl = document.getElementById("newest-data");
+  const oldestEl = document.getElementById("oldest-data");
+  if (!newestEl || !oldestEl) return;
 
   if (!allRows.length) {
-    el.textContent = isHistoryLoading ? "History: loading..." : "History: no data";
+    newestEl.textContent = "—";
+    oldestEl.textContent = "—";
     return;
   }
 
-  const oldest = allRows[0]?.ts;
-  const oldestText = formatHistoryTs(oldest);
-  const rangeLabel = getRangeLabel(activeHours);
-
-  if (isHistoryLoading) {
-    el.textContent = `History (${rangeLabel}): loading older data... oldest ${oldestText}`;
-    return;
-  }
-
-  const stillNeeds = needsMoreHistory(activeHours);
-  if (stillNeeds) {
-    el.textContent = `History (${rangeLabel}): partial, oldest ${oldestText}`;
-    return;
-  }
-
-  if (hasCompleteHistory) {
-    el.textContent = `History (${rangeLabel}): complete, oldest ${oldestText}`;
-    return;
-  }
-
-  el.textContent = `History (${rangeLabel}): range covered, oldest ${oldestText}`;
+  newestEl.textContent = formatHistoryTs(allRows[allRows.length - 1]?.ts);
+  oldestEl.textContent = formatHistoryTs(allRows[0]?.ts);
 }
 
 function needsMoreHistory(hours) {
@@ -215,14 +205,14 @@ function applyCurrentView() {
   const filtered = filterByHours(allRows, activeHours);
   updateStats(filtered, allRows);
   renderAll(filtered);
-  updateHistoryLoadStatus();
+  updateHeaderTimes_();
 }
 
 async function loadMoreHistoryInBackground(seq) {
   if (!needsMoreHistory(activeHours)) return;
   historyLoadSeq = seq;
   isHistoryLoading = true;
-  updateHistoryLoadStatus();
+  updateHeaderTimes_();
 
   let beforeTsIso = allRows[0]?.timestamp_iso || null;
   if (!beforeTsIso) return;
@@ -250,7 +240,7 @@ async function loadMoreHistoryInBackground(seq) {
   } finally {
     if (seq === refreshSeq && seq === historyLoadSeq) {
       isHistoryLoading = false;
-      updateHistoryLoadStatus();
+      updateHeaderTimes_();
     }
   }
 }
@@ -727,7 +717,7 @@ document.querySelectorAll(".range-btn").forEach(btn => {
     // If the newly selected range needs older points, continue paginating in background.
     loadMoreHistoryInBackground(refreshSeq).catch(err => {
       isHistoryLoading = false;
-      updateHistoryLoadStatus();
+      updateHeaderTimes_();
       const errBanner = document.getElementById("error-banner");
       errBanner.textContent = "Background history load failed: " + err.message;
       errBanner.classList.remove("hidden");
@@ -748,7 +738,7 @@ async function refresh() {
   try {
     isHistoryLoading = false;
     hasCompleteHistory = false;
-    updateHistoryLoadStatus();
+    updateHeaderTimes_();
 
     const firstPageDesc = await fetchTelemetryPage(FETCH_LIMIT, null);
     allRows = normalizeRowsForCharts(firstPageDesc);
@@ -772,16 +762,16 @@ async function refresh() {
     loadMoreHistoryInBackground(seq).catch(err => {
       if (seq !== refreshSeq) return;
       isHistoryLoading = false;
-      updateHistoryLoadStatus();
+      updateHeaderTimes_();
       errBanner.textContent = "Background history load failed: " + err.message;
       errBanner.classList.remove("hidden");
     });
 
     document.getElementById("last-updated").textContent =
-      "Updated " + new Date().toLocaleTimeString();
+      formatHistoryTs(new Date());
   } catch (err) {
     isHistoryLoading = false;
-    updateHistoryLoadStatus();
+    updateHeaderTimes_();
     errBanner.textContent = "Failed to load data: " + err.message;
     errBanner.classList.remove("hidden");
   } finally {
