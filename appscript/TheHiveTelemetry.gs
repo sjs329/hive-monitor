@@ -11,6 +11,7 @@ const WEBHOOK_SAMPLE_LOG_RATE = 0.02; // 2% of all webhook calls
 const HIVE_CONFIG_PROP_KEY = "HIVE_CONFIG_JSON";
 const HIVE_CONFIG_CACHE_KEY = "hive_config_cache_v1";
 const HIVE_CONFIG_ADMIN_PROP_KEY = "HIVE_CONFIG_ADMIN_KEY";
+const LBS_PER_KG = 2.2046226218;
 
 // ── Webhook receiver (Arduino Cloud POST) ────────────────────────────────────
 
@@ -378,7 +379,7 @@ function parseDeviceIds_(raw) {
 function mapSheetRows_(values) {
   return values.map(r => ({
     timestamp_iso: r[0], device_id: r[1],
-    weight_kg: toNumOrNull_(r[2]), battery_v: toNumOrNull_(r[3]),
+    weight_lbs: toNumOrNull_(r[2]), battery_v: toNumOrNull_(r[3]),
     battery_pct: toNumOrNull_(r[4]), battery_charge_rate: toNumOrNull_(r[5]),
     battery_connected: r[6] === "" ? null : Boolean(r[6]),
     temperature_c: toNumOrNull_(r[7]), humidity_pct: toNumOrNull_(r[8]),
@@ -478,7 +479,7 @@ function getCompareRows_(deviceIds) {
       battery_pct_diff: diffNumber_(sheet && sheet.battery_pct, supabase && supabase.battery_pct),
       battery_v_diff: diffNumber_(sheet && sheet.battery_v, supabase && supabase.battery_v),
       battery_charge_rate_diff: diffNumber_(sheet && sheet.battery_charge_rate, supabase && supabase.battery_charge_rate),
-      weight_kg_diff: diffNumber_(sheet && sheet.weight_kg, supabase && supabase.weight_kg),
+      weight_lbs_diff: diffNumber_(sheet && sheet.weight_lbs, supabase && supabase.weight_lbs),
       temperature_c_diff: diffNumber_(sheet && sheet.temperature_c, supabase && supabase.temperature_c),
       humidity_pct_diff: diffNumber_(sheet && sheet.humidity_pct, supabase && supabase.humidity_pct)
     };
@@ -510,7 +511,13 @@ function getSupabaseLatestRows_(deviceIds) {
   }
 
   const rows = JSON.parse(String(res.getContentText() || "[]"));
-  return Array.isArray(rows) ? rows : [];
+  if (!Array.isArray(rows)) return [];
+  return rows.map(row => {
+    const weightValue = toNumOrNull_((row && row.weight_lbs) != null ? row.weight_lbs : (row && row.weight_kg));
+    return Object.assign({}, row, {
+      weight_lbs: weightValue
+    });
+  });
 }
 
 function indexByDeviceId_(rows) {
@@ -557,7 +564,7 @@ function parseArduinoPayload_(p) {
   const ts = parseTimestamp_(p);
   const deviceId = String(p.device_id || p.deviceId || p.thing_id || p.thingId || p.id || "");
 
-  let weight = NaN;
+  let weightLbs = NaN;
   let battV = NaN;
   let battPct = NaN;
   let battChargeRate = NaN;
@@ -578,8 +585,14 @@ function parseArduinoPayload_(p) {
         battChargeRate = Number(v);
       } else if (name === "battery_connected") {
         battConnected = Boolean(v);
+      } else if (name === "weight_lbs") {
+        weightLbs = Number(v);
+      } else if (name === "weight_kg") {
+        const kg = Number(v);
+        weightLbs = Number.isFinite(kg) ? (kg * LBS_PER_KG) : NaN;
       } else if (name.includes("weight") || name.includes("hive_weight")) {
-        weight = Number(v);
+        // Backward compatibility for legacy variable names.
+        weightLbs = Number(v);
       } else if (name === "temperature" || name === "temperature_c" || name === "temp") {
         temp = Number(v);
       } else if (name === "humidity" || name === "humidity_pct" || name === "relative_humidity") {
@@ -591,7 +604,7 @@ function parseArduinoPayload_(p) {
   return {
     timestamp_iso: ts,
     device_id: deviceId,
-    weight_kg: Number.isFinite(weight) ? weight : null,
+    weight_lbs: Number.isFinite(weightLbs) ? weightLbs : null,
     battery_v: Number.isFinite(battV) ? battV : null,
     battery_pct: Number.isFinite(battPct) ? battPct : null,
     battery_charge_rate: Number.isFinite(battChargeRate) ? battChargeRate : null,
@@ -612,7 +625,7 @@ function mergeWithLastKnownState_(incoming) {
   const merged = {
     timestamp_iso: incoming.timestamp_iso,
     device_id: incoming.device_id || prev.device_id || "",
-    weight_kg: incoming.weight_kg ?? prev.weight_kg ?? null,
+    weight_lbs: incoming.weight_lbs ?? incoming.weight_kg ?? prev.weight_lbs ?? prev.weight_kg ?? null,
     battery_v: incoming.battery_v ?? prev.battery_v ?? null,
     battery_pct: incoming.battery_pct ?? prev.battery_pct ?? null,
     battery_charge_rate: incoming.battery_charge_rate ?? prev.battery_charge_rate ?? null,
@@ -633,8 +646,15 @@ function getOrCreateSheet_() {
   let sh = ss.getSheetByName(SHEET_NAME);
   if (!sh) {
     sh = ss.insertSheet(SHEET_NAME);
-    sh.appendRow(["timestamp_iso", "device_id", "weight_kg", "battery_v", "battery_pct", "battery_charge_rate", "battery_connected", "temperature_c", "humidity_pct", "source", "event_raw"]);
+    sh.appendRow(["timestamp_iso", "device_id", "weight_lbs", "battery_v", "battery_pct", "battery_charge_rate", "battery_connected", "temperature_c", "humidity_pct", "source", "event_raw"]);
   }
+
+  // One-time header rename keeps Sheets aligned with lbs semantics.
+  const headerWeightName = String(sh.getRange(1, 3).getValue() || "").trim().toLowerCase();
+  if (headerWeightName === "weight_kg") {
+    sh.getRange(1, 3).setValue("weight_lbs");
+  }
+
   return sh;
 }
 
@@ -642,7 +662,7 @@ function upsertTelemetryRow_(sh, merged, raw) {
   const rowValues = [
     merged.timestamp_iso,
     merged.device_id || "",
-    merged.weight_kg ?? "",
+    merged.weight_lbs ?? "",
     merged.battery_v ?? "",
     merged.battery_pct ?? "",
     merged.battery_charge_rate ?? "",
@@ -736,7 +756,7 @@ function writeSupabaseBestEffort_(merged, raw) {
   const payload = {
     ts: merged.timestamp_iso,
     device_id: deviceId,
-    weight_kg: merged.weight_kg,
+    weight_lbs: merged.weight_lbs,
     battery_v: merged.battery_v,
     battery_pct: merged.battery_pct,
     battery_charge_rate: merged.battery_charge_rate,
@@ -750,7 +770,7 @@ function writeSupabaseBestEffort_(merged, raw) {
   const latestPayload = {
     device_id: deviceId,
     ts: merged.timestamp_iso,
-    weight_kg: merged.weight_kg,
+    weight_lbs: merged.weight_lbs,
     battery_v: merged.battery_v,
     battery_pct: merged.battery_pct,
     battery_charge_rate: merged.battery_charge_rate,
@@ -1006,7 +1026,7 @@ function backfillSheetDataToSupabase() {
       payloads.push({
         ts: tsIso,
         device_id: deviceId,
-        weight_kg: toNumOrNull_(r[2]),
+        weight_lbs: toNumOrNull_(r[2]),
         battery_v: toNumOrNull_(r[3]),
         battery_pct: toNumOrNull_(r[4]),
         battery_charge_rate: toNumOrNull_(r[5]),

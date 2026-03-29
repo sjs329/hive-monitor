@@ -1,6 +1,22 @@
 // overview.js — landing page logic
 
 const LIVE_TIMEOUT_MS = 15 * 60 * 1000;
+const INVALID_CALIBRATION_WEIGHT_SENTINEL = -1234.5;
+const INVALID_CALIBRATION_WEIGHT_EPS = 0.01;
+
+function isInvalidCalibrationWeight_(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return false;
+  return Math.abs(n - INVALID_CALIBRATION_WEIGHT_SENTINEL) <= INVALID_CALIBRATION_WEIGHT_EPS;
+}
+
+function getWeightLbs_(row) {
+  if (!row) return null;
+  const direct = Number(row.weight_lbs);
+  if (Number.isFinite(direct)) return direct;
+  const legacy = Number(row.weight_kg);
+  return Number.isFinite(legacy) ? legacy : null;
+}
 
 function getHivesConfig_() {
   if (typeof getConfiguredHives === "function") return getConfiguredHives();
@@ -118,7 +134,11 @@ function buildCard(hive, latest) {
     ? latest.ts.toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" })
     : null;
 
-  const weight = hasData && latest.weight_kg != null ? latest.weight_kg.toFixed(2) : null;
+  const weightLbs = hasData ? getWeightLbs_(latest) : null;
+  const hasInvalidWeight = hasData && isInvalidCalibrationWeight_(weightLbs);
+  const weight = hasInvalidWeight
+    ? "Calibrate scale"
+    : (weightLbs != null ? weightLbs.toFixed(2) : null);
   const pct    = hasData && latest.battery_pct != null ? latest.battery_pct.toFixed(1) : null;
   const volts  = hasData && latest.battery_v != null ? latest.battery_v.toFixed(3) : null;
   const rate   = hasData && latest.battery_charge_rate != null ? latest.battery_charge_rate.toFixed(1) : null;
@@ -159,7 +179,7 @@ function buildCard(hive, latest) {
             : '<span class="hc-badge hc-badge--wait">Stale</span>'}
       </div>
       <div class="hc-stats">
-        ${statLine("Weight", weight, "kg")}
+        ${statLine("Weight", weight, hasInvalidWeight ? "" : "lbs")}
         ${statLine("Temperature", temp, "°C")}
         ${statLine("Humidity", hum, "%")}
       </div>
@@ -167,6 +187,7 @@ function buildCard(hive, latest) {
         <span class="hc-monitor-label">Monitor</span>
         <span class="hc-monitor-value">🔋 ${pct != null ? pct + "%" : "—"}</span>
       </div>
+      ${hasInvalidWeight ? '<div class="hc-footer hc-footer--warn">Scale not calibrated. Run tare, then calibrate with a known weight.</div>' : ""}
       ${lastSeen ? `<div class="hc-footer">Last reading: ${lastSeen}</div>` : ""}
       <div class="hc-cta">View Details →</div>
     </a>`;

@@ -59,6 +59,8 @@ let hasCompleteHistory = false;
 let isHistoryLoading = false;
 
 const SHUTDOWN_PCT = 2;
+const INVALID_CALIBRATION_WEIGHT_SENTINEL = -1234.5;
+const INVALID_CALIBRATION_WEIGHT_EPS = 0.01;
 const MIN_RATE_FOR_ETA = 0.05;
 const EST_MIN_POINTS = 4;
 const EST_HISTORY_WINDOW_HOURS = 2.25;
@@ -73,6 +75,22 @@ const EST_LOCAL_OUTLIER_Z = 3.25;
 const EST_MIN_LOCAL_SPAN_HOURS = 0.4;
 const EST_LATEST_DECAY_HOURS = 0.7;
 const EST_FALLBACK_NEAREST_SEGMENTS = 8;
+const WEIGHT_NO_DATA_DEFAULT_TEXT = "No weight data yet — add a weight sensor to your Arduino Thing to enable this chart.";
+const WEIGHT_NEEDS_CALIBRATION_TEXT = "Scale not calibrated yet. In IoT Cloud, run Tare with empty hive, then Calibrate with a known weight.";
+
+function isInvalidCalibrationWeight_(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return false;
+  return Math.abs(n - INVALID_CALIBRATION_WEIGHT_SENTINEL) <= INVALID_CALIBRATION_WEIGHT_EPS;
+}
+
+function getWeightLbs_(row) {
+  if (!row) return null;
+  const direct = Number(row.weight_lbs);
+  if (Number.isFinite(direct)) return direct;
+  const legacy = Number(row.weight_kg);
+  return Number.isFinite(legacy) ? legacy : null;
+}
 
 const PLOTLY_LAYOUT_BASE = {
   paper_bgcolor: "rgba(0,0,0,0)",
@@ -177,7 +195,7 @@ async function fetchTelemetryPage(limit, beforeTsIso = null) {
   }
 
   const query = new URLSearchParams({
-    select: "ts,device_id,weight_kg,battery_v,battery_pct,battery_charge_rate,battery_connected,temperature_c,humidity_pct,source",
+    select: "ts,device_id,weight_lbs,battery_v,battery_pct,battery_charge_rate,battery_connected,temperature_c,humidity_pct,source",
     order: "ts.desc",
     limit: String(limit),
   });
@@ -479,9 +497,17 @@ function updateStats(rows, trendRows = rows) {
   if (!rows.length) return;
   const latest = rows[rows.length - 1];
 
-  const weight = latest.weight_kg;
-  document.getElementById("stat-weight").textContent =
-    weight != null ? weight.toFixed(2) : "—";
+  const weight = getWeightLbs_(latest);
+  const statWeightEl = document.getElementById("stat-weight");
+  if (isInvalidCalibrationWeight_(weight)) {
+    statWeightEl.textContent = "Calibrate";
+    statWeightEl.style.color = "var(--danger)";
+    statWeightEl.setAttribute("title", "Scale not calibrated. Run tare, then calibrate with a known weight.");
+  } else {
+    statWeightEl.textContent = weight != null ? weight.toFixed(2) : "—";
+    statWeightEl.style.color = "";
+    statWeightEl.removeAttribute("title");
+  }
 
   const pct = latest.battery_pct;
   const statPctEl = document.getElementById("stat-battery-pct");
@@ -535,27 +561,31 @@ function layout(yTitle, extraY) {
 }
 
 function renderWeightChart(rows) {
-  const withWeight = rows.filter(r => r.weight_kg != null);
-  const card = document.getElementById("weight-card");
+  const withWeight = rows
+    .map(r => ({ ...r, weight_lbs: getWeightLbs_(r) }))
+    .filter(r => r.weight_lbs != null && !isInvalidCalibrationWeight_(r.weight_lbs));
+  const hasInvalidWeight = rows.some(r => isInvalidCalibrationWeight_(getWeightLbs_(r)));
   const noDataMsg = document.getElementById("weight-no-data");
 
   if (!withWeight.length) {
+    noDataMsg.textContent = hasInvalidWeight ? WEIGHT_NEEDS_CALIBRATION_TEXT : WEIGHT_NO_DATA_DEFAULT_TEXT;
     noDataMsg.classList.remove("hidden");
     document.getElementById("chart-weight").style.display = "none";
     return;
   }
+  noDataMsg.textContent = WEIGHT_NO_DATA_DEFAULT_TEXT;
   noDataMsg.classList.add("hidden");
   document.getElementById("chart-weight").style.display = "";
 
   Plotly.react("chart-weight", [{
     x: withWeight.map(r => r.ts),
-    y: withWeight.map(r => r.weight_kg),
+    y: withWeight.map(r => r.weight_lbs),
     mode: "lines+markers",
-    name: "Weight (kg)",
+    name: "Weight (lbs)",
     line: { color: "#c8820a", width: 2.5 },
     marker: { size: 4 },
-    hovertemplate: "%{y:.3f} kg<extra></extra>",
-  }], layout("kg"), { responsive: true });
+    hovertemplate: "%{y:.3f} lbs<extra></extra>",
+  }], layout("lbs"), { responsive: true });
 }
 
 function renderBatteryPctChart(rows) {

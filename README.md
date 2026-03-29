@@ -278,7 +278,7 @@ Required Script Properties:
 
 - `timestamp_iso`
 - `device_id`
-- `weight_kg`
+- `weight_lbs`
 - `battery_v`
 - `battery_pct`
 - `battery_charge_rate`

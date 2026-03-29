@@ -9,24 +9,36 @@ const char SSID[]               = SECRET_SSID;    // Network SSID (name)
 const char PASS[]               = SECRET_OPTIONAL_PASS;    // Network password (use for WPA, or use as key for WEP)
 const char DEVICE_KEY[]  = SECRET_DEVICE_KEY;    // Secret device password
 
+void onCalWeightLbsChange();
+void onCalibrateNowChange();
+void onStayAwakeForUpdateChange();
+void onTareChange();
 
 float battery_charge;
 float battery_charge_rate;
 float battery_voltage;
+float cal_weight_lbs;
+float raw_scale_counts;
+float weight_lbs;
 bool battery_connected;
+bool calibrate_now;
 bool stay_awake_for_update;
-
-void onStayAwakeForUpdateChange();
+bool tare;
 
 void initProperties(){
 
   ArduinoCloud.setBoardId(DEVICE_LOGIN_NAME);
   ArduinoCloud.setSecretDeviceKey(DEVICE_KEY);
-  ArduinoCloud.addProperty(battery_charge, READ, 1 * SECONDS, NULL);
-  ArduinoCloud.addProperty(battery_charge_rate, READ, 1 * SECONDS, NULL);
-  ArduinoCloud.addProperty(battery_voltage, READ, 1 * SECONDS, NULL);
-  ArduinoCloud.addProperty(battery_connected, READ, 1 * SECONDS, NULL);
+  ArduinoCloud.addProperty(battery_charge, READ, 10 * SECONDS, NULL);
+  ArduinoCloud.addProperty(battery_charge_rate, READ, 10 * SECONDS, NULL);
+  ArduinoCloud.addProperty(battery_voltage, READ, 10 * SECONDS, NULL);
+  ArduinoCloud.addProperty(cal_weight_lbs, READWRITE, ON_CHANGE, onCalWeightLbsChange);
+  ArduinoCloud.addProperty(raw_scale_counts, READ, 10 * SECONDS, NULL);
+  ArduinoCloud.addProperty(weight_lbs, READ, 10 * SECONDS, NULL);
+  ArduinoCloud.addProperty(battery_connected, READ, 10 * SECONDS, NULL);
+  ArduinoCloud.addProperty(calibrate_now, READWRITE, ON_CHANGE, onCalibrateNowChange);
   ArduinoCloud.addProperty(stay_awake_for_update, READWRITE, ON_CHANGE, onStayAwakeForUpdateChange);
+  ArduinoCloud.addProperty(tare, READWRITE, ON_CHANGE, onTareChange);
 
 }
 

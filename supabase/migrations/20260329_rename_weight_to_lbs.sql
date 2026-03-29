@@ -1,8 +1,3 @@
--- The Hive Supabase schema
--- Apply in Supabase SQL Editor.
-
-create extension if not exists pgcrypto;
-
 do $$
 begin
   if exists (
@@ -37,57 +32,6 @@ begin
     execute 'alter table public.telemetry_latest rename column weight_kg to weight_lbs';
   end if;
 end $$;
-
-create table if not exists public.telemetry_raw (
-  id bigint generated always as identity primary key,
-  ts timestamptz not null,
-  device_id text not null,
-  weight_lbs double precision,
-  battery_v double precision,
-  battery_pct double precision,
-  battery_charge_rate double precision,
-  battery_connected boolean,
-  temperature_c double precision,
-  humidity_pct double precision,
-  source text not null default 'arduino-cloud',
-  event_raw jsonb,
-  received_at timestamptz not null default now()
-);
-
-create index if not exists telemetry_raw_device_ts_idx
-  on public.telemetry_raw (device_id, ts desc);
-
-create index if not exists telemetry_raw_ts_idx
-  on public.telemetry_raw (ts desc);
-
-create table if not exists public.telemetry_latest (
-  device_id text primary key,
-  ts timestamptz not null,
-  weight_lbs double precision,
-  battery_v double precision,
-  battery_pct double precision,
-  battery_charge_rate double precision,
-  battery_connected boolean,
-  temperature_c double precision,
-  humidity_pct double precision,
-  source text not null,
-  event_raw jsonb,
-  updated_at timestamptz not null default now()
-);
-
-create table if not exists public.hive_config (
-  id text primary key,
-  label text not null,
-  icon text not null default 'favicon.svg',
-  device_id text unique,
-  active boolean not null default false,
-  location text not null default '',
-  sort_order integer not null default 0,
-  updated_at timestamptz not null default now()
-);
-
-create index if not exists hive_config_sort_idx
-  on public.hive_config (sort_order asc, id asc);
 
 create or replace function public.upsert_latest_from_raw()
 returns trigger
@@ -140,10 +84,7 @@ begin
 end;
 $$;
 
-drop trigger if exists trg_upsert_latest_from_raw on public.telemetry_raw;
-create trigger trg_upsert_latest_from_raw
-after insert on public.telemetry_raw
-for each row execute function public.upsert_latest_from_raw();
+drop function if exists public.get_latest(text[]);
 
 create or replace function public.get_latest(p_device_ids text[] default null)
 returns table (
@@ -176,6 +117,8 @@ as $$
   where p_device_ids is null or l.device_id = any(p_device_ids)
   order by l.device_id;
 $$;
+
+drop function if exists public.get_series(text, integer, integer);
 
 create or replace function public.get_series(
   p_device_id text,
@@ -235,28 +178,3 @@ as $$
   from bucketed
   order by bucket_ts;
 $$;
-
-alter table public.telemetry_raw enable row level security;
-alter table public.telemetry_latest enable row level security;
-alter table public.hive_config enable row level security;
-
--- Public dashboard reads (anon/authenticated) are allowed.
-drop policy if exists telemetry_raw_read on public.telemetry_raw;
-create policy telemetry_raw_read
-on public.telemetry_raw
-for select
-using (true);
-
-drop policy if exists telemetry_latest_read on public.telemetry_latest;
-create policy telemetry_latest_read
-on public.telemetry_latest
-for select
-using (true);
-
-drop policy if exists hive_config_read on public.hive_config;
-create policy hive_config_read
-on public.hive_config
-for select
-using (true);
-
--- Writes should come from a secret API key (or legacy service role key), which can bypass RLS.
