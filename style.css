@@ -37,7 +37,7 @@ header {
   align-items: center;
   gap: 14px;
 }
-.logo { font-size: 2rem; line-height: 1; }
+.logo { font-size: 2rem; line-height: 1; flex-shrink: 0; }
 .logo-image {
   width: 2.85rem;
   height: 2.85rem;
