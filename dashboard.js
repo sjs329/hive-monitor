@@ -575,7 +575,10 @@ function renderWeightChart(rows) {
     line: { color: "#c8820a", width: 2.5 },
     marker: { size: 4 },
     hovertemplate: "%{y:.3f} lbs<extra></extra>",
-  }], layout("lbs"), { responsive: true });
+  }], {
+    ...layout("lbs"),
+    yaxis: { ...layout("lbs").yaxis, rangemode: "nonnegative" },
+  }, { responsive: true });
 }
 
 function renderBatteryPctChart(rows) {
