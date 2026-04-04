@@ -220,7 +220,7 @@ Dashboard frontend is now consolidated to one script set:
 - `overview.js` (overview page logic)
 - `dashboard.js` (detail page logic)
 
-Both `index.html`/`hive.html` and compatibility pages (`index-supabase.html`/`hive-supabase.html`) use the same canonical scripts.
+The canonical pages are `index.html` and `hive.html`, both using the shared scripts above.
 
 Set `DATA_SOURCE` in `hives.js`:
 
