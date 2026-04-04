@@ -46,9 +46,9 @@ const uint32_t STAY_AWAKE_SAMPLE_PERIOD_MS = 30000UL;
 const float MIN_VALID_BATTERY_VOLTAGE = 2.5f;
 const uint32_t SCALE_SAMPLE_PERIOD_MS = 10000UL;
 const uint32_t HX711_READY_TIMEOUT_MS = 250UL;
-const uint8_t SCALE_AVG_SAMPLES = 5;
+const uint8_t SCALE_AVG_SAMPLES = 30;
 const float SCALE_MIN_FACTOR_ABS = 0.0001f;
-const float SCALE_NEAR_ZERO_LBS = 0.02f;
+const float SCALE_NEAR_ZERO_LBS = 0.5f;
 
 const char* SCALE_PREFS_NAMESPACE = "hx711";
 const char* SCALE_PREF_OFFSET_KEY = "offset";
@@ -94,7 +94,7 @@ bool readScaleRawAverage_(int32_t &outCounts) {
     if (!waitForScaleReady_(HX711_READY_TIMEOUT_MS)) {
       return false;
     }
-    sum += scale.readChannelRaw(CHAN_A_GAIN_128);
+    sum += scale.readChannelRaw(CHAN_A_GAIN_64);
     samples++;
   }
 
@@ -104,12 +104,36 @@ bool readScaleRawAverage_(int32_t &outCounts) {
 
 bool initScale_() {
   scale.begin();
+#if DEBUG_SERIAL
+  Serial.println("HX711 scale.begin() called");
+#endif
   scaleInitialized = true;
 
   // Prime a couple reads so first published value is less noisy.
   int32_t throwaway = 0;
-  readScaleRawAverage_(throwaway);
-  readScaleRawAverage_(throwaway);
+  const bool prime1 = readScaleRawAverage_(throwaway);
+#if DEBUG_SERIAL
+  Serial.print("HX711 prime read #1 ok: ");
+  Serial.print(prime1 ? "true" : "false");
+  if (prime1) {
+    Serial.print(", raw=");
+    Serial.println(throwaway);
+  } else {
+    Serial.println();
+  }
+#endif
+
+  const bool prime2 = readScaleRawAverage_(throwaway);
+#if DEBUG_SERIAL
+  Serial.print("HX711 prime read #2 ok: ");
+  Serial.print(prime2 ? "true" : "false");
+  if (prime2) {
+    Serial.print(", raw=");
+    Serial.println(throwaway);
+  } else {
+    Serial.println();
+  }
+#endif
   return true;
 }
 
@@ -263,7 +287,7 @@ void enterDeepSleep() {
 void setup() {
 #if DEBUG_SERIAL
   Serial.begin(115200);
-  delay(1500);
+  delay(10000);
 #endif
 
   disableBoardPowerDraw();

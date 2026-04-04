@@ -3,6 +3,8 @@ const SHEET_NAME = "telemetry";
 const SHARED_SECRET = "watson-doesnt-eat-avi-but-poppy-does"; // same secret used in Arduino webhook URL
 const MAX_DEFAULT_ROWS = 1000;
 const DEDUPE_WINDOW_MS = 45000; // collapse burst updates from one wake cycle
+const STAY_AWAKE_INFER_THRESHOLD_MS = 25000;
+const STAY_AWAKE_INFER_STREAK = 3;
 const GET_CACHE_SECONDS = 30;
 const MAX_CACHE_PAYLOAD_CHARS = 90000;
 const SUPABASE_DUAL_WRITE_ENABLED_DEFAULT = false;
@@ -569,6 +571,7 @@ function parseArduinoPayload_(p) {
   let battPct = NaN;
   let battChargeRate = NaN;
   let battConnected = null;
+  let stayAwakeForUpdate = null;
   let temp = NaN; 
   let humidity = NaN;
 
@@ -585,6 +588,14 @@ function parseArduinoPayload_(p) {
         battChargeRate = Number(v);
       } else if (name === "battery_connected") {
         battConnected = Boolean(v);
+      } else if (name === "stay_awake_for_update") {
+        if (v === true || v === false) {
+          stayAwakeForUpdate = v;
+        } else {
+          const text = String(v || "").trim().toLowerCase();
+          if (text === "true" || text === "1") stayAwakeForUpdate = true;
+          if (text === "false" || text === "0") stayAwakeForUpdate = false;
+        }
       } else if (name === "weight_lbs") {
         weightLbs = Number(v);
       } else if (name === "weight_kg") {
@@ -609,6 +620,7 @@ function parseArduinoPayload_(p) {
     battery_pct: Number.isFinite(battPct) ? battPct : null,
     battery_charge_rate: Number.isFinite(battChargeRate) ? battChargeRate : null,
     battery_connected: battConnected,
+    stay_awake_for_update: stayAwakeForUpdate,
     temperature_c: Number.isFinite(temp) ? temp : null,
     humidity_pct: Number.isFinite(humidity) ? humidity : null,
     source: "arduino-cloud"
@@ -622,6 +634,26 @@ function mergeWithLastKnownState_(incoming) {
   const key = "last_state_" + (incoming.device_id || "default");
   const prev = JSON.parse(props.getProperty(key) || "{}");
 
+  const prevTsMs = Date.parse(String(prev.timestamp_iso || ""));
+  const currentTsMs = Date.parse(String(incoming.timestamp_iso || ""));
+  const rapidUpdate = Number.isFinite(prevTsMs)
+    && Number.isFinite(currentTsMs)
+    && Math.abs(currentTsMs - prevTsMs) <= STAY_AWAKE_INFER_THRESHOLD_MS;
+  const rapidUpdateStreak = rapidUpdate ? (Number(prev.rapid_update_streak) || 0) + 1 : 0;
+
+  let stayAwakeState = null;
+  if (incoming.stay_awake_for_update != null) {
+    stayAwakeState = incoming.stay_awake_for_update;
+  } else if (rapidUpdate && prev.stay_awake_for_update === true) {
+    stayAwakeState = true;
+  } else if (rapidUpdateStreak >= STAY_AWAKE_INFER_STREAK) {
+    stayAwakeState = true;
+  } else if (!rapidUpdate) {
+    stayAwakeState = false;
+  } else {
+    stayAwakeState = prev.stay_awake_for_update != null ? prev.stay_awake_for_update : null;
+  }
+
   const merged = {
     timestamp_iso: incoming.timestamp_iso,
     device_id: incoming.device_id || prev.device_id || "",
@@ -630,6 +662,8 @@ function mergeWithLastKnownState_(incoming) {
     battery_pct: incoming.battery_pct ?? prev.battery_pct ?? null,
     battery_charge_rate: incoming.battery_charge_rate ?? prev.battery_charge_rate ?? null,
     battery_connected: incoming.battery_connected ?? prev.battery_connected ?? null,
+    stay_awake_for_update: stayAwakeState,
+    rapid_update_streak: rapidUpdateStreak,
     temperature_c: incoming.temperature_c ?? prev.temperature_c ?? null,
     humidity_pct: incoming.humidity_pct ?? prev.humidity_pct ?? null,
     source: incoming.source || "arduino-cloud"
@@ -686,6 +720,7 @@ function upsertTelemetryRow_(sh, merged, raw) {
   const currentDevice = String(merged.device_id || "");
 
   const canDedupe =
+    merged.stay_awake_for_update !== true &&
     currentDevice !== "" &&
     lastDevice === currentDevice &&
     !isNaN(lastTs.getTime()) &&
@@ -803,7 +838,7 @@ function writeSupabaseBestEffort_(merged, raw) {
     let res;
     let action = "inserted";
 
-    if (latestRow && shouldDedupeSupabaseRow_(latestRow.ts, merged.timestamp_iso, deviceId, latestRow.device_id)) {
+    if (merged.stay_awake_for_update !== true && latestRow && shouldDedupeSupabaseRow_(latestRow.ts, merged.timestamp_iso, deviceId, latestRow.device_id)) {
       res = UrlFetchApp.fetch(
         cfg.url + "/rest/v1/telemetry_raw?id=eq." + encodeURIComponent(String(latestRow.id)),
         {
@@ -947,6 +982,105 @@ function upsertSupabaseLatest_(cfg, payload, headers) {
     status: code,
     error: String(res.getContentText() || "").slice(0, 300)
   };
+}
+
+// ── One-time maintenance helpers ─────────────────────────────────────────────
+
+/**
+ * Clears only weight values while preserving every row and all non-weight data.
+ *
+ * Targets:
+ * - Google Sheet column C (weight_lbs) for all data rows in SHEET_NAME.
+ * - Supabase public.telemetry_raw.weight_lbs and public.telemetry_latest.weight_lbs.
+ *
+ * Safe to run multiple times.
+ */
+function clearWeightDataOnly() {
+  const result = {
+    ok: true,
+    sheet: {
+      rows_total: 0,
+      weight_cells_cleared: 0
+    },
+    supabase: {
+      attempted: false,
+      telemetry_raw_status: null,
+      telemetry_latest_status: null,
+      legacy_weight_kg_status: null,
+      warning: ""
+    }
+  };
+
+  const sh = getOrCreateSheet_();
+  const lastRow = sh.getLastRow();
+  if (lastRow >= 2) {
+    const numRows = lastRow - 1;
+    const values = sh.getRange(2, 3, numRows, 1).getValues();
+    let nonEmpty = 0;
+    for (const r of values) {
+      if (String(r[0] || "").trim() !== "") nonEmpty++;
+    }
+
+    sh.getRange(2, 3, numRows, 1).clearContent();
+    result.sheet.rows_total = numRows;
+    result.sheet.weight_cells_cleared = nonEmpty;
+  }
+
+  const cfg = getSupabaseAdminConfig_();
+  if (!cfg.enabled) {
+    result.supabase.warning = "supabase_not_configured";
+    return result;
+  }
+
+  result.supabase.attempted = true;
+  const baseHeaders = {
+    apikey: cfg.key,
+    Authorization: "Bearer " + cfg.key,
+    Prefer: "return=minimal",
+    "User-Agent": "the-hive-appscript/1.0",
+    "X-Client-Info": "the-hive-appscript/1.0"
+  };
+
+  const rawRes = UrlFetchApp.fetch(cfg.url + "/rest/v1/telemetry_raw?weight_lbs=not.is.null", {
+    method: "patch",
+    contentType: "application/json",
+    muteHttpExceptions: true,
+    headers: baseHeaders,
+    payload: JSON.stringify({ weight_lbs: null })
+  });
+  result.supabase.telemetry_raw_status = Number(rawRes.getResponseCode());
+
+  const latestRes = UrlFetchApp.fetch(cfg.url + "/rest/v1/telemetry_latest?weight_lbs=not.is.null", {
+    method: "patch",
+    contentType: "application/json",
+    muteHttpExceptions: true,
+    headers: baseHeaders,
+    payload: JSON.stringify({ weight_lbs: null })
+  });
+  result.supabase.telemetry_latest_status = Number(latestRes.getResponseCode());
+
+  // Optional legacy cleanup for projects that still use weight_kg.
+  const legacyRes = UrlFetchApp.fetch(cfg.url + "/rest/v1/telemetry_raw?weight_kg=not.is.null", {
+    method: "patch",
+    contentType: "application/json",
+    muteHttpExceptions: true,
+    headers: baseHeaders,
+    payload: JSON.stringify({ weight_kg: null })
+  });
+  result.supabase.legacy_weight_kg_status = Number(legacyRes.getResponseCode());
+
+  const rawOk = result.supabase.telemetry_raw_status >= 200 && result.supabase.telemetry_raw_status < 300;
+  const latestOk = result.supabase.telemetry_latest_status >= 200 && result.supabase.telemetry_latest_status < 300;
+  const legacyOk = result.supabase.legacy_weight_kg_status >= 200 && result.supabase.legacy_weight_kg_status < 300;
+  const legacyIgnored = result.supabase.legacy_weight_kg_status === 400 || result.supabase.legacy_weight_kg_status === 404;
+
+  result.ok = rawOk && latestOk && (legacyOk || legacyIgnored);
+  if (!result.ok) {
+    result.supabase.warning = "supabase_weight_clear_incomplete";
+  }
+
+  Logger.log("clearWeightDataOnly result: %s", JSON.stringify(result));
+  return result;
 }
 
 // ── One-time Sheet → Supabase backfill ───────────────────────────────────────

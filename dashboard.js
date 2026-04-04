@@ -577,7 +577,7 @@ function renderWeightChart(rows) {
     hovertemplate: "%{y:.3f} lbs<extra></extra>",
   }], {
     ...layout("lbs"),
-    yaxis: { ...layout("lbs").yaxis, rangemode: "nonnegative" },
+    yaxis: { ...layout("lbs").yaxis },
   }, { responsive: true });
 }
 
