@@ -20,6 +20,9 @@ const WEIGHT_FILTER_EMA_TAU_MIN = 300;
 const WEIGHT_FILTER_CONSISTENCY_BAND_LB = 0.28;
 const WEIGHT_FILTER_UNLOCK_MIN_POINTS = 4;
 const WEIGHT_FILTER_UNLOCK_MIN_MINUTES = 20;
+const WEIGHT_INVALID_CALIBRATION_SENTINEL_LBS = -1234.5;
+const WEIGHT_READ_FAILED_SENTINEL_LBS = -2234.5;
+const WEIGHT_SENTINEL_EPS = 0.02;
 
 // ── Webhook receiver (Arduino Cloud POST) ────────────────────────────────────
 
@@ -702,6 +705,19 @@ function parseArduinoPayload_(p) {
   let stayAwakeForUpdate = null;
   let temp = NaN; 
   let humidity = NaN;
+  let weightPresent = false;
+  let weightReadFailed = false;
+
+  function parseWeightMaybeNull_(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return null;
+    if (Math.abs(n - WEIGHT_INVALID_CALIBRATION_SENTINEL_LBS) <= WEIGHT_SENTINEL_EPS) return null;
+    if (Math.abs(n - WEIGHT_READ_FAILED_SENTINEL_LBS) <= WEIGHT_SENTINEL_EPS) {
+      weightReadFailed = true;
+      return null;
+    }
+    return n;
+  }
 
   if (Array.isArray(p.values)) {
     for (const item of p.values) {
@@ -725,13 +741,21 @@ function parseArduinoPayload_(p) {
           if (text === "false" || text === "0") stayAwakeForUpdate = false;
         }
       } else if (name === "weight_lbs") {
-        weightLbs = Number(v);
+        weightPresent = true;
+        const parsed = parseWeightMaybeNull_(v);
+        weightLbs = parsed == null ? NaN : parsed;
       } else if (name === "weight_kg") {
         const kg = Number(v);
-        weightLbs = Number.isFinite(kg) ? (kg * LBS_PER_KG) : NaN;
+        if (Number.isFinite(kg)) {
+          weightPresent = true;
+          const parsed = parseWeightMaybeNull_(kg * LBS_PER_KG);
+          weightLbs = parsed == null ? NaN : parsed;
+        }
       } else if (name.includes("weight") || name.includes("hive_weight")) {
         // Backward compatibility for legacy variable names.
-        weightLbs = Number(v);
+        weightPresent = true;
+        const parsed = parseWeightMaybeNull_(v);
+        weightLbs = parsed == null ? NaN : parsed;
       } else if (name === "temperature" || name === "temperature_c" || name === "temp") {
         temp = Number(v);
       } else if (name === "humidity" || name === "humidity_pct" || name === "relative_humidity") {
@@ -751,6 +775,8 @@ function parseArduinoPayload_(p) {
     stay_awake_for_update: stayAwakeForUpdate,
     temperature_c: Number.isFinite(temp) ? temp : null,
     humidity_pct: Number.isFinite(humidity) ? humidity : null,
+    weight_present: weightPresent,
+    weight_read_failed: weightReadFailed,
     source: "arduino-cloud"
   };
 }
@@ -782,12 +808,16 @@ function mergeWithLastKnownState_(incoming) {
     stayAwakeState = prev.stay_awake_for_update != null ? prev.stay_awake_for_update : null;
   }
 
-  const filteredState = updateFilteredWeightState_(incoming.weight_lbs ?? prev.weight_lbs ?? null, incoming.timestamp_iso, prev);
+  const mergedWeight = incoming.weight_present
+    ? (incoming.weight_lbs ?? null)
+    : (incoming.weight_lbs ?? incoming.weight_kg ?? prev.weight_lbs ?? prev.weight_kg ?? null);
+
+  const filteredState = updateFilteredWeightState_(mergedWeight, incoming.timestamp_iso, prev);
 
   const merged = {
     timestamp_iso: incoming.timestamp_iso,
     device_id: incoming.device_id || prev.device_id || "",
-    weight_lbs: incoming.weight_lbs ?? incoming.weight_kg ?? prev.weight_lbs ?? prev.weight_kg ?? null,
+    weight_lbs: mergedWeight,
     filtered_weight_lbs: filteredState.filtered,
     battery_v: incoming.battery_v ?? prev.battery_v ?? null,
     battery_pct: incoming.battery_pct ?? prev.battery_pct ?? null,
@@ -797,6 +827,7 @@ function mergeWithLastKnownState_(incoming) {
     rapid_update_streak: rapidUpdateStreak,
     temperature_c: incoming.temperature_c ?? prev.temperature_c ?? null,
     humidity_pct: incoming.humidity_pct ?? prev.humidity_pct ?? null,
+    weight_read_failed: incoming.weight_read_failed === true,
     source: incoming.source || "arduino-cloud",
     fw_last_filtered: filteredState.state.fw_last_filtered,
     fw_last_accepted_raw: filteredState.state.fw_last_accepted_raw,

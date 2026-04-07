@@ -11,8 +11,8 @@
   float battery_charge_rate;
   float battery_voltage;
   float cal_weight_lbs;
-  float raw_scale_counts;
   float weight_lbs;
+  int raw_scale_counts;
   bool battery_connected;
   bool calibrate_now;
   bool stay_awake_for_update;
@@ -48,9 +48,14 @@ const uint32_t STAY_AWAKE_SAMPLE_PERIOD_MS = 30000UL;
 const float MIN_VALID_BATTERY_VOLTAGE = 2.5f;
 const uint32_t SCALE_SAMPLE_PERIOD_MS = 10000UL;
 const uint32_t HX711_READY_TIMEOUT_MS = 250UL;
+const uint8_t SCALE_READ_RETRIES = 3;
+const uint32_t SCALE_READ_RETRY_DELAY_MS = 60UL;
 const uint8_t SCALE_AVG_SAMPLES = 30;
 const float SCALE_MIN_FACTOR_ABS = 0.0001f;
 const float SCALE_NEAR_ZERO_LBS = 0.5f;
+const float WEIGHT_INVALID_CALIBRATION_SENTINEL_LBS = -1234.5f;
+const float WEIGHT_READ_FAILED_SENTINEL_LBS = -2234.5f;
+const int32_t RAW_SCALE_READ_FAILED_SENTINEL_COUNTS = -2147483000;
 
 const char* SCALE_PREFS_NAMESPACE = "hx711";
 const char* SCALE_PREF_OFFSET_KEY = "offset";
@@ -104,6 +109,21 @@ bool readScaleRawAverage_(int32_t &outCounts) {
   return true;
 }
 
+bool readScaleRawAverageWithRetries_(int32_t &outCounts) {
+  for (uint8_t attempt = 0; attempt < SCALE_READ_RETRIES; ++attempt) {
+    if (readScaleRawAverage_(outCounts)) {
+      return true;
+    }
+    delay(SCALE_READ_RETRY_DELAY_MS);
+  }
+  return false;
+}
+
+void markScaleReadFailed_() {
+  raw_scale_counts = RAW_SCALE_READ_FAILED_SENTINEL_COUNTS;
+  weight_lbs = WEIGHT_READ_FAILED_SENTINEL_LBS;
+}
+
 bool initScale_() {
   scale.begin();
 #if DEBUG_SERIAL
@@ -113,7 +133,7 @@ bool initScale_() {
 
   // Prime a couple reads so first published value is less noisy.
   int32_t throwaway = 0;
-  const bool prime1 = readScaleRawAverage_(throwaway);
+  const bool prime1 = readScaleRawAverageWithRetries_(throwaway);
 #if DEBUG_SERIAL
   Serial.print("HX711 prime read #1 ok: ");
   Serial.print(prime1 ? "true" : "false");
@@ -125,7 +145,7 @@ bool initScale_() {
   }
 #endif
 
-  const bool prime2 = readScaleRawAverage_(throwaway);
+  const bool prime2 = readScaleRawAverageWithRetries_(throwaway);
 #if DEBUG_SERIAL
   Serial.print("HX711 prime read #2 ok: ");
   Serial.print(prime2 ? "true" : "false");
@@ -141,14 +161,15 @@ bool initScale_() {
 
 bool refreshWeightReading_() {
   int32_t raw = 0;
-  if (!readScaleRawAverage_(raw)) {
+  if (!readScaleRawAverageWithRetries_(raw)) {
+    markScaleReadFailed_();
     return false;
   }
 
-  raw_scale_counts = static_cast<float>(raw);
+  raw_scale_counts = raw;
 
   if (!isScaleCalibrated_()) {
-    weight_lbs = -1234.5f;
+    weight_lbs = WEIGHT_INVALID_CALIBRATION_SENTINEL_LBS;
     return true;
   }
 
@@ -159,7 +180,7 @@ bool refreshWeightReading_() {
 
 bool tareScale_() {
   int32_t raw = 0;
-  if (!readScaleRawAverage_(raw)) return false;
+  if (!readScaleRawAverageWithRetries_(raw)) return false;
   scaleOffsetCounts = raw;
   saveScaleCalibration_();
   return refreshWeightReading_();
@@ -169,7 +190,7 @@ bool calibrateScaleFromKnownWeight_() {
   if (cal_weight_lbs <= 0.0f) return false;
 
   int32_t raw = 0;
-  if (!readScaleRawAverage_(raw)) return false;
+  if (!readScaleRawAverageWithRetries_(raw)) return false;
 
   const int32_t deltaCounts = raw - scaleOffsetCounts;
   if (deltaCounts == 0) return false;
@@ -303,6 +324,9 @@ void setup() {
 
   // Defined in thingProperties.h
   initProperties();
+
+  // Initialize to explicit read-failure sentinels until a valid sample arrives.
+  markScaleReadFailed_();
 
   cal_weight_lbs = cal_weight_lbs > 0.0f ? cal_weight_lbs : 10.0f;
   calibrate_now = false;
