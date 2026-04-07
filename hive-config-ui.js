@@ -240,6 +240,7 @@
     let busy = false;
     let statusTimer = null;
     let statusEl = panel.querySelector(".config-status");
+    let unsavedDialogEl = null;
 
     if (!statusEl) {
       statusEl = document.createElement("div");
@@ -292,6 +293,97 @@
       }
     }
 
+    function toComparableRows(rows) {
+      return (Array.isArray(rows) ? rows : []).map((row) => ({
+        id: String(row && row.id || ""),
+        label: String(row && row.label || ""),
+        icon: String(row && row.icon || ""),
+        device_id: row && row.device_id != null ? String(row.device_id) : null,
+        location: String(row && row.location || ""),
+        active: Boolean(row && row.active),
+      }));
+    }
+
+    function hasUnsavedChanges() {
+      if (!open) return false;
+      const current = toComparableRows(parseRows(listEl));
+      const saved = toComparableRows(global.getConfiguredHives());
+      return JSON.stringify(current) !== JSON.stringify(saved);
+    }
+
+    async function saveCurrentEdits_() {
+      if (busy) return false;
+      const parsed = parseRows(listEl);
+      const error = validateRows(parsed);
+      if (error) {
+        showError(error);
+        return false;
+      }
+
+      try {
+        setBusy(true, "Saving...");
+        showStatus("Saving hive settings...", "info", true);
+        const saved = await global.saveConfiguredHives(parsed);
+        draft = saved;
+        renderRows(listEl, draft, iconOptions);
+        showError("");
+        showStatus("Hive settings saved.", "success", false);
+
+        if (typeof opts.onSave === "function") {
+          opts.onSave(saved);
+        }
+        return true;
+      } catch (err) {
+        showStatus("", "info", true);
+        showError(`Save failed: ${err.message || err}`);
+        return false;
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    function ensureUnsavedDialog_() {
+      if (unsavedDialogEl) return unsavedDialogEl;
+
+      const wrap = document.createElement("div");
+      wrap.className = "config-unsaved-dialog hidden";
+      wrap.innerHTML = `
+        <div class="config-unsaved-dialog__backdrop" data-action="continue"></div>
+        <div class="config-unsaved-dialog__card" role="dialog" aria-modal="true" aria-label="Unsaved changes">
+          <h3>Unsaved Changes</h3>
+          <p>You have unsaved hive config changes.</p>
+          <div class="config-unsaved-dialog__actions">
+            <button type="button" class="config-btn config-btn--primary" data-action="save">Save changes</button>
+            <button type="button" class="config-btn config-btn--danger" data-action="discard">Discard changes</button>
+            <button type="button" class="config-btn" data-action="continue">Continue editing</button>
+          </div>
+        </div>`;
+
+      panel.appendChild(wrap);
+      unsavedDialogEl = wrap;
+      return unsavedDialogEl;
+    }
+
+    function promptUnsavedAction_() {
+      const dialog = ensureUnsavedDialog_();
+
+      return new Promise((resolve) => {
+        const onClick = (event) => {
+          const target = event.target;
+          if (!(target instanceof HTMLElement)) return;
+          const action = target.getAttribute("data-action");
+          if (!action) return;
+
+          dialog.classList.add("hidden");
+          dialog.removeEventListener("click", onClick);
+          resolve(action === "save" || action === "discard" ? action : "continue");
+        };
+
+        dialog.classList.remove("hidden");
+        dialog.addEventListener("click", onClick);
+      });
+    }
+
     function showError(message) {
       if (!errorEl) return;
       if (!message) {
@@ -334,8 +426,28 @@
       }
     }
 
-    toggleBtn.addEventListener("click", () => {
-      setOpen(!open);
+    toggleBtn.addEventListener("click", async () => {
+      if (!open) {
+        setOpen(true);
+        return;
+      }
+
+      if (!hasUnsavedChanges()) {
+        setOpen(false);
+        return;
+      }
+
+      const action = await promptUnsavedAction_();
+
+      if (action === "save") {
+        const ok = await saveCurrentEdits_();
+        if (ok) setOpen(false);
+        return;
+      }
+
+      if (action === "discard") {
+        setOpen(false);
+      }
     });
 
     listEl.addEventListener("click", (event) => {
@@ -463,32 +575,7 @@
 
     if (saveBtn) {
       saveBtn.addEventListener("click", async () => {
-        if (busy) return;
-        const parsed = parseRows(listEl);
-        const error = validateRows(parsed);
-        if (error) {
-          showError(error);
-          return;
-        }
-
-        try {
-          setBusy(true, "Saving...");
-          showStatus("Saving hive settings...", "info", true);
-          const saved = await global.saveConfiguredHives(parsed);
-          draft = saved;
-          renderRows(listEl, draft, iconOptions);
-          showError("");
-          showStatus("Hive settings saved.", "success", false);
-
-          if (typeof opts.onSave === "function") {
-            opts.onSave(saved);
-          }
-        } catch (err) {
-          showStatus("", "info", true);
-          showError(`Save failed: ${err.message || err}`);
-        } finally {
-          setBusy(false);
-        }
+        await saveCurrentEdits_();
       });
     }
 
