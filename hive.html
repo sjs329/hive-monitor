@@ -36,6 +36,7 @@
       <div class="stat-card stat-card--hive">
         <div class="stat-label">Weight</div>
         <div class="stat-value" id="stat-weight">—</div>
+        <div class="stat-subvalue" id="stat-weight-raw"></div>
         <div class="stat-unit">lbs</div>
       </div>
       <div class="stat-card stat-card--hive">
@@ -95,8 +96,15 @@
 
     <div class="chart-card" id="weight-card">
       <h2>Hive Weight</h2>
+      <div class="debug-toggle-row">
+        <button id="toggle-raw-counts" class="debug-toggle-btn" type="button" aria-expanded="false">Show Raw Counts Debug</button>
+      </div>
       <div id="chart-weight" class="chart-container"></div>
       <p class="no-data-msg hidden" id="weight-no-data">No weight data yet — add a weight sensor to your Arduino Thing to enable this chart.</p>
+      <div id="raw-counts-wrap" class="hidden">
+        <div id="chart-raw-counts" class="chart-container chart-container--compact"></div>
+        <p class="no-data-msg hidden" id="raw-counts-no-data">No raw scale-count values are available for this range.</p>
+      </div>
     </div>
 
     <div class="chart-card" id="temp-humidity-card">

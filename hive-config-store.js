@@ -77,6 +77,42 @@
     return raw;
   }
 
+  function getSupabaseConfig_() {
+    const url = String(global.SUPABASE_URL || "").trim().replace(/\/+$/, "");
+    const anonKey = String(global.SUPABASE_ANON_KEY || "").trim();
+    return {
+      enabled: Boolean(url && anonKey),
+      url,
+      anonKey,
+    };
+  }
+
+  async function fetchConfigFromSupabase_() {
+    const cfg = getSupabaseConfig_();
+    if (!cfg.enabled) return null;
+
+    const url = `${cfg.url}/rest/v1/hive_config?select=id,label,icon,device_id,active,location,sort_order&order=sort_order.asc,id.asc`;
+    const res = await withTimeout_(
+      fetch(url, {
+        cache: "no-store",
+        headers: {
+          apikey: cfg.anonKey,
+          Authorization: `Bearer ${cfg.anonKey}`,
+        },
+      }),
+      CONFIG_READ_TIMEOUT_MS,
+      "Supabase config load"
+    );
+
+    if (!res.ok) throw new Error(`Supabase config HTTP ${res.status}`);
+    const rows = await res.json();
+    if (!Array.isArray(rows)) {
+      throw new Error("invalid supabase config response");
+    }
+
+    return rows;
+  }
+
   function withTimeout_(promise, ms, label) {
     return Promise.race([
       promise,
@@ -97,13 +133,29 @@
     if (didLoadOnce && !forceReload) return clone(stateHives);
 
     const apiUrl = getConfigApiUrl_();
-    if (!apiUrl) {
+    const supabaseCfg = getSupabaseConfig_();
+    if (!apiUrl && !supabaseCfg.enabled) {
       stateHives = normalizeHives([], getDefaultHives());
       didLoadOnce = true;
       return clone(stateHives);
     }
 
+    let lastErr = null;
     try {
+      if (supabaseCfg.enabled) {
+        const supabaseRows = await fetchConfigFromSupabase_();
+        if (Array.isArray(supabaseRows)) {
+          stateHives = normalizeHives(supabaseRows, getDefaultHives());
+          didLoadOnce = true;
+          return clone(stateHives);
+        }
+      }
+    } catch (err) {
+      lastErr = err;
+    }
+
+    try {
+      if (!apiUrl) throw (lastErr || new Error("Missing CONFIG_API_URL/API_URL"));
       const url = `${apiUrl}?mode=config_get`;
       const res = await withTimeout_(fetch(url, { cache: "no-store" }), CONFIG_READ_TIMEOUT_MS, "Config load");
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -118,7 +170,7 @@
         stateHives = normalizeHives([], getDefaultHives());
         didLoadOnce = true;
       }
-      throw err;
+      throw (lastErr || err);
     }
   }
 

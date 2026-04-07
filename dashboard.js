@@ -57,6 +57,11 @@ let refreshSeq = 0;
 let historyLoadSeq = 0;
 let hasCompleteHistory = false;
 let isHistoryLoading = false;
+let showRawCountsDebug = false;
+let hasWeightChartSyncBinding = false;
+let hasRawChartSyncBinding = false;
+let isSyncingAxisRange = false;
+let fullWeightCtx = null;
 
 const SHUTDOWN_PCT = 2;
 const INVALID_CALIBRATION_WEIGHT_SENTINEL = -1234.5;
@@ -90,6 +95,30 @@ function getWeightLbs_(row) {
   if (Number.isFinite(direct)) return direct;
   const legacy = Number(row.weight_kg);
   return Number.isFinite(legacy) ? legacy : null;
+}
+
+function getFilteredWeightLbs_(row) {
+  if (!row) return null;
+  const n = Number(row.filtered_weight_lbs);
+  return Number.isFinite(n) ? n : null;
+}
+
+function getRawScaleCounts_(row) {
+  if (!row) return null;
+
+  const direct = Number(row.raw_scale_counts);
+  if (Number.isFinite(direct)) return direct;
+
+  const eventRaw = row.event_raw;
+  if (!eventRaw || !Array.isArray(eventRaw.values)) return null;
+
+  for (const item of eventRaw.values) {
+    if (String(item && item.name || "").toLowerCase() !== "raw_scale_counts") continue;
+    const parsed = Number(item.value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
 }
 
 const PLOTLY_LAYOUT_BASE = {
@@ -185,7 +214,7 @@ async function fetchTelemetryPage(limit, beforeTsIso = null) {
   }
 
   const query = new URLSearchParams({
-    select: "ts,device_id,weight_lbs,battery_v,battery_pct,battery_charge_rate,battery_connected,temperature_c,humidity_pct,source",
+    select: "ts,device_id,weight_lbs,filtered_weight_lbs,battery_v,battery_pct,battery_charge_rate,battery_connected,temperature_c,humidity_pct,source,event_raw",
     order: "ts.desc",
     limit: String(limit),
   });
@@ -203,9 +232,110 @@ async function fetchTelemetryPage(limit, beforeTsIso = null) {
 
 function applyCurrentView() {
   const filtered = filterByHours(allRows, activeHours);
-  updateStats(filtered, allRows);
-  renderAll(filtered);
+  const weightCtx = sliceWeightPlotContextByHours_(fullWeightCtx, activeHours);
+  updateStats(filtered, allRows, weightCtx);
+  renderAll(filtered, weightCtx);
   updateHeaderTimes_();
+}
+
+function toPlotlyGap_(v) {
+  return Number.isFinite(v) ? v : null;
+}
+
+function buildWeightPlotContext_(rows) {
+  const points = rows
+    .map(r => ({
+      ts: r.ts,
+      rawWeight: getWeightLbs_(r),
+      filteredWeight: getFilteredWeightLbs_(r),
+      rawCounts: getRawScaleCounts_(r),
+    }))
+    .filter(p => p.ts instanceof Date && !Number.isNaN(p.ts.getTime()) && p.rawWeight != null && !isInvalidCalibrationWeight_(p.rawWeight));
+
+  if (!points.length) {
+    const hasInvalidWeight = rows.some(r => isInvalidCalibrationWeight_(getWeightLbs_(r)));
+    return {
+      points: [],
+      filteredWeights: [],
+      outlierMask: [],
+      hasInvalidWeight,
+      latestRawWeight: null,
+      latestFilteredWeight: null,
+      rawCountsPoints: [],
+    };
+  }
+
+  // The frontend should display server-computed filtered weights only.
+  // Raw fallback keeps historic pre-backfill ranges viewable.
+  const filteredWeights = points.map(p => Number.isFinite(p.filteredWeight) ? p.filteredWeight : p.rawWeight);
+  const outlierMask = new Array(points.length).fill(false);
+
+  const latestRawWeight = points[points.length - 1].rawWeight;
+  let latestFilteredWeight = null;
+  for (let i = filteredWeights.length - 1; i >= 0; i--) {
+    if (Number.isFinite(filteredWeights[i])) {
+      latestFilteredWeight = filteredWeights[i];
+      break;
+    }
+  }
+
+  return {
+    points,
+    filteredWeights,
+    outlierMask,
+    hasInvalidWeight: rows.some(r => isInvalidCalibrationWeight_(getWeightLbs_(r))),
+    latestRawWeight,
+    latestFilteredWeight,
+    rawCountsPoints: points.filter(p => Number.isFinite(p.rawCounts)),
+  };
+}
+
+function sliceWeightPlotContextByHours_(weightCtx, hours) {
+  if (!weightCtx || !Array.isArray(weightCtx.points) || !weightCtx.points.length) {
+    return weightCtx || {
+      points: [],
+      filteredWeights: [],
+      outlierMask: [],
+      hasInvalidWeight: false,
+      latestRawWeight: null,
+      latestFilteredWeight: null,
+      rawCountsPoints: [],
+    };
+  }
+
+  if (!hours) return weightCtx;
+
+  const cutoff = new Date(Date.now() - hours * 3600 * 1000);
+  let start = 0;
+  while (start < weightCtx.points.length && weightCtx.points[start].ts < cutoff) {
+    start++;
+  }
+
+  const slicedPoints = weightCtx.points.slice(start);
+  const slicedFiltered = weightCtx.filteredWeights.slice(start);
+  const slicedOutliers = weightCtx.outlierMask.slice(start);
+
+  let latestFilteredWeight = null;
+  for (let i = slicedFiltered.length - 1; i >= 0; i--) {
+    if (Number.isFinite(slicedFiltered[i])) {
+      latestFilteredWeight = slicedFiltered[i];
+      break;
+    }
+  }
+
+  return {
+    points: slicedPoints,
+    filteredWeights: slicedFiltered,
+    outlierMask: slicedOutliers,
+    hasInvalidWeight: weightCtx.hasInvalidWeight,
+    latestRawWeight: slicedPoints.length ? slicedPoints[slicedPoints.length - 1].rawWeight : null,
+    latestFilteredWeight,
+    rawCountsPoints: slicedPoints.filter(p => Number.isFinite(p.rawCounts)),
+  };
+}
+
+function recomputeWeightCtx_() {
+  fullWeightCtx = buildWeightPlotContext_(allRows);
 }
 
 async function loadMoreHistoryInBackground(seq) {
@@ -232,6 +362,7 @@ async function loadMoreHistoryInBackground(seq) {
 
       const pageAsc = normalizeRowsForCharts(pageDesc);
       allRows = pageAsc.concat(allRows);
+      recomputeWeightCtx_();
       beforeTsIso = allRows[0]?.timestamp_iso || null;
 
       // Repaint as history arrives so "All" and multi-day ranges expand in-place.
@@ -483,20 +614,32 @@ function estimateShutdown(rows) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Stat cards
 // ─────────────────────────────────────────────────────────────────────────────
-function updateStats(rows, trendRows = rows) {
+function updateStats(rows, trendRows = rows, weightCtx = null) {
   if (!rows.length) return;
   const latest = rows[rows.length - 1];
 
   const weight = getWeightLbs_(latest);
   const statWeightEl = document.getElementById("stat-weight");
+  const statWeightRawEl = document.getElementById("stat-weight-raw");
+  const filteredWeight = weightCtx && Number.isFinite(weightCtx.latestFilteredWeight)
+    ? weightCtx.latestFilteredWeight
+    : null;
+  const rawWeight = weightCtx && Number.isFinite(weightCtx.latestRawWeight)
+    ? weightCtx.latestRawWeight
+    : (weight != null ? Number(weight) : null);
+
   if (isInvalidCalibrationWeight_(weight)) {
     statWeightEl.textContent = "Calibrate";
     statWeightEl.style.color = "var(--danger)";
     statWeightEl.setAttribute("title", "Scale not calibrated. Run tare, then calibrate with a known weight.");
+    if (statWeightRawEl) statWeightRawEl.textContent = "";
   } else {
-    statWeightEl.textContent = weight != null ? weight.toFixed(2) : "—";
+    statWeightEl.textContent = filteredWeight != null ? filteredWeight.toFixed(2) : (rawWeight != null ? rawWeight.toFixed(2) : "—");
     statWeightEl.style.color = "";
     statWeightEl.removeAttribute("title");
+    if (statWeightRawEl) {
+      statWeightRawEl.textContent = rawWeight != null ? `raw ${rawWeight.toFixed(2)} lbs` : "";
+    }
   }
 
   const pct = latest.battery_pct;
@@ -550,11 +693,9 @@ function layout(yTitle, extraY) {
   };
 }
 
-function renderWeightChart(rows) {
-  const withWeight = rows
-    .map(r => ({ ...r, weight_lbs: getWeightLbs_(r) }))
-    .filter(r => r.weight_lbs != null && !isInvalidCalibrationWeight_(r.weight_lbs));
-  const hasInvalidWeight = rows.some(r => isInvalidCalibrationWeight_(getWeightLbs_(r)));
+function renderWeightChart(rows, weightCtx) {
+  const withWeight = weightCtx ? weightCtx.points : [];
+  const hasInvalidWeight = weightCtx ? weightCtx.hasInvalidWeight : false;
   const noDataMsg = document.getElementById("weight-no-data");
 
   if (!withWeight.length) {
@@ -567,18 +708,144 @@ function renderWeightChart(rows) {
   noDataMsg.classList.add("hidden");
   document.getElementById("chart-weight").style.display = "";
 
-  Plotly.react("chart-weight", [{
+  const xRange = withWeight.length
+    ? [withWeight[0].ts, withWeight[withWeight.length - 1].ts]
+    : undefined;
+
+  const filteredTrace = {
     x: withWeight.map(r => r.ts),
-    y: withWeight.map(r => r.weight_lbs),
+    y: weightCtx.filteredWeights.map(toPlotlyGap_),
+    mode: "lines",
+    name: "Filtered",
+    line: { color: "#3b7a57", width: 3.2 },
+    hovertemplate: "%{y:.3f} lbs (filtered)<extra></extra>",
+  };
+
+  const rawTrace = {
+    x: withWeight.map(r => r.ts),
+    y: withWeight.map(r => r.rawWeight),
     mode: "lines+markers",
-    name: "Weight (lbs)",
-    line: { color: "#c8820a", width: 2.5 },
-    marker: { size: 4 },
-    hovertemplate: "%{y:.3f} lbs<extra></extra>",
-  }], {
+    name: "Raw",
+    line: { color: "rgba(200,130,10,0.2)", width: 1, dash: "dot" },
+    marker: { size: 2, color: "rgba(200,130,10,0.18)" },
+    hovertemplate: "%{y:.3f} lbs (raw)<extra></extra>",
+  };
+
+  const outlierPoints = withWeight.filter((_, idx) => weightCtx.outlierMask[idx]);
+  const outlierTrace = {
+    x: outlierPoints.map(p => p.ts),
+    y: outlierPoints.map(p => p.rawWeight),
+    mode: "markers",
+    name: "Rejected outliers",
+    marker: { size: 5, color: "rgba(176,58,46,0.28)", symbol: "x" },
+    hovertemplate: "%{y:.3f} lbs (rejected)<extra></extra>",
+  };
+
+  Plotly.react("chart-weight", [filteredTrace, rawTrace, outlierTrace], {
     ...layout("lbs"),
+    xaxis: { ...PLOTLY_LAYOUT_BASE.xaxis, range: xRange },
     yaxis: { ...layout("lbs").yaxis },
   }, { responsive: true });
+
+  if (!hasWeightChartSyncBinding) {
+    const weightChartEl = document.getElementById("chart-weight");
+    if (weightChartEl) {
+      weightChartEl.on("plotly_relayout", (ev) => {
+        if (!showRawCountsDebug) return;
+        if (isSyncingAxisRange) return;
+        const rawChartEl = document.getElementById("chart-raw-counts");
+        if (!rawChartEl) return;
+
+        isSyncingAxisRange = true;
+        try {
+          if (ev["xaxis.autorange"]) {
+            Plotly.relayout(rawChartEl, { "xaxis.autorange": true });
+            return;
+          }
+
+          if (ev["xaxis.range[0]"] && ev["xaxis.range[1]"]) {
+            Plotly.relayout(rawChartEl, {
+              "xaxis.range[0]": ev["xaxis.range[0]"],
+              "xaxis.range[1]": ev["xaxis.range[1]"],
+            });
+          }
+        } finally {
+          setTimeout(() => { isSyncingAxisRange = false; }, 0);
+        }
+      });
+      hasWeightChartSyncBinding = true;
+    }
+  }
+}
+
+function renderRawCountsChart_(rows, weightCtx) {
+  const wrap = document.getElementById("raw-counts-wrap");
+  const chart = document.getElementById("chart-raw-counts");
+  const noData = document.getElementById("raw-counts-no-data");
+  const toggle = document.getElementById("toggle-raw-counts");
+
+  if (!wrap || !chart || !noData || !toggle) return;
+
+  wrap.classList.toggle("hidden", !showRawCountsDebug);
+  toggle.textContent = showRawCountsDebug ? "Hide Raw Counts Debug" : "Show Raw Counts Debug";
+  toggle.setAttribute("aria-expanded", showRawCountsDebug ? "true" : "false");
+
+  if (!showRawCountsDebug) return;
+
+  const rawPoints = (weightCtx && weightCtx.rawCountsPoints) || [];
+  const weightPoints = (weightCtx && weightCtx.points) || [];
+  if (!rawPoints.length) {
+    noData.classList.remove("hidden");
+    chart.style.display = "none";
+    return;
+  }
+
+  noData.classList.add("hidden");
+  chart.style.display = "";
+
+  const xRange = weightPoints.length
+    ? [weightPoints[0].ts, weightPoints[weightPoints.length - 1].ts]
+    : undefined;
+
+  Plotly.react("chart-raw-counts", [{
+    x: rawPoints.map(p => p.ts),
+    y: rawPoints.map(p => p.rawCounts),
+    mode: "lines+markers",
+    name: "Raw scale counts",
+    line: { color: "#1f4f82", width: 2 },
+    marker: { size: 3 },
+    hovertemplate: "%{y:.0f} counts<extra></extra>",
+  }], {
+    ...layout("counts"),
+    xaxis: { ...PLOTLY_LAYOUT_BASE.xaxis, range: xRange },
+  }, { responsive: true });
+
+  if (!hasRawChartSyncBinding) {
+    chart.on("plotly_relayout", (ev) => {
+      if (!showRawCountsDebug) return;
+      if (isSyncingAxisRange) return;
+      const weightChartEl = document.getElementById("chart-weight");
+      if (!weightChartEl) return;
+
+      isSyncingAxisRange = true;
+      try {
+        if (ev["xaxis.autorange"]) {
+          Plotly.relayout(weightChartEl, { "xaxis.autorange": true });
+          return;
+        }
+
+        if (ev["xaxis.range[0]"] && ev["xaxis.range[1]"]) {
+          Plotly.relayout(weightChartEl, {
+            "xaxis.range[0]": ev["xaxis.range[0]"],
+            "xaxis.range[1]": ev["xaxis.range[1]"],
+          });
+        }
+      } finally {
+        setTimeout(() => { isSyncingAxisRange = false; }, 0);
+      }
+    });
+    hasRawChartSyncBinding = true;
+  }
 }
 
 function renderBatteryPctChart(rows) {
@@ -699,8 +966,9 @@ function renderTempHumidityChart(rows) {
   }, { responsive: true });
 }
 
-function renderAll(rows) {
-  renderWeightChart(rows);
+function renderAll(rows, weightCtx) {
+  renderWeightChart(rows, weightCtx);
+  renderRawCountsChart_(rows, weightCtx);
   renderBatteryPctChart(rows);
   renderBatteryVChart(rows);
   renderChargeRateChart(rows);
@@ -728,6 +996,16 @@ document.querySelectorAll(".range-btn").forEach(btn => {
   });
 });
 
+const rawCountsToggleBtn = document.getElementById("toggle-raw-counts");
+if (rawCountsToggleBtn) {
+  rawCountsToggleBtn.addEventListener("click", () => {
+    showRawCountsDebug = !showRawCountsDebug;
+    const filtered = filterByHours(allRows, activeHours);
+    const weightCtx = sliceWeightPlotContextByHours_(fullWeightCtx, activeHours);
+    renderRawCountsChart_(filtered, weightCtx);
+  });
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Refresh
 // ─────────────────────────────────────────────────────────────────────────────
@@ -745,6 +1023,7 @@ async function refresh() {
 
     const firstPageDesc = await fetchTelemetryPage(FETCH_LIMIT, null);
     allRows = normalizeRowsForCharts(firstPageDesc);
+    recomputeWeightCtx_();
     if (!firstPageDesc.length) {
       hasCompleteHistory = true;
     }

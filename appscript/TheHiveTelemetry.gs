@@ -14,6 +14,12 @@ const HIVE_CONFIG_PROP_KEY = "HIVE_CONFIG_JSON";
 const HIVE_CONFIG_CACHE_KEY = "hive_config_cache_v1";
 const HIVE_CONFIG_ADMIN_PROP_KEY = "HIVE_CONFIG_ADMIN_KEY";
 const LBS_PER_KG = 2.2046226218;
+const WEIGHT_FILTER_MAX_RATE_LB_PER_MIN = 0.05;
+const WEIGHT_FILTER_STEP_MARGIN_LB = 0.24;
+const WEIGHT_FILTER_EMA_TAU_MIN = 300;
+const WEIGHT_FILTER_CONSISTENCY_BAND_LB = 0.28;
+const WEIGHT_FILTER_UNLOCK_MIN_POINTS = 4;
+const WEIGHT_FILTER_UNLOCK_MIN_MINUTES = 20;
 
 // ── Webhook receiver (Arduino Cloud POST) ────────────────────────────────────
 
@@ -115,8 +121,18 @@ function doGet(e) {
     const deviceId = (e.parameter && e.parameter.device_id) ? String(e.parameter.device_id) : "";
     const deviceIds = parseDeviceIds_(e.parameter && e.parameter.device_ids);
 
-    if (mode !== "data" && mode !== "latest" && mode !== "compare" && mode !== "config_get") {
+    if (mode !== "data" && mode !== "latest" && mode !== "compare" && mode !== "config_get" && mode !== "recompute_filter_history") {
       return json_({ ok: false, error: "Unsupported mode" });
+    }
+
+    if (mode === "recompute_filter_history") {
+      if (!isAuthorizedAdminRequest_(e)) {
+        return json_({ ok: false, error: "Unauthorized" });
+      }
+      const target = (e.parameter && e.parameter.target) ? String(e.parameter.target) : "all";
+      const deviceIdsCsv = (e.parameter && e.parameter.device_ids) ? String(e.parameter.device_ids) : "";
+      const result = recomputeFilteredWeightHistory(target, deviceIdsCsv);
+      return json_(Object.assign({ ok: Boolean(result && result.ok) }, result));
     }
 
     if (mode === "config_get") {
@@ -381,18 +397,18 @@ function parseDeviceIds_(raw) {
 function mapSheetRows_(values) {
   return values.map(r => ({
     timestamp_iso: r[0], device_id: r[1],
-    weight_lbs: toNumOrNull_(r[2]), battery_v: toNumOrNull_(r[3]),
-    battery_pct: toNumOrNull_(r[4]), battery_charge_rate: toNumOrNull_(r[5]),
-    battery_connected: r[6] === "" ? null : Boolean(r[6]),
-    temperature_c: toNumOrNull_(r[7]), humidity_pct: toNumOrNull_(r[8]),
-    source: r[9]
+    weight_lbs: toNumOrNull_(r[2]), filtered_weight_lbs: toNumOrNull_(r[3]), battery_v: toNumOrNull_(r[4]),
+    battery_pct: toNumOrNull_(r[5]), battery_charge_rate: toNumOrNull_(r[6]),
+    battery_connected: r[7] === "" ? null : Boolean(r[7]),
+    temperature_c: toNumOrNull_(r[8]), humidity_pct: toNumOrNull_(r[9]),
+    source: r[10]
   }));
 }
 
 function getRecentRows_(sh, lastRow, limit, deviceId) {
   const startRow = Math.max(2, lastRow - limit + 1);
   const numRows = lastRow - startRow + 1;
-  const values = sh.getRange(startRow, 1, numRows, 11).getValues();
+  const values = sh.getRange(startRow, 1, numRows, 12).getValues();
   const rows = mapSheetRows_(values);
 
   if (!deviceId) return rows;
@@ -402,7 +418,7 @@ function getRecentRows_(sh, lastRow, limit, deviceId) {
 function getLatestRows_(sh, lastRow, scanLimit, deviceIds) {
   const startRow = Math.max(2, lastRow - scanLimit + 1);
   const numRows = lastRow - startRow + 1;
-  const values = sh.getRange(startRow, 1, numRows, 11).getValues();
+  const values = sh.getRange(startRow, 1, numRows, 12).getValues();
   const rows = mapSheetRows_(values);
   const wanted = deviceIds.length ? new Set(deviceIds) : null;
   const seen = new Set();
@@ -482,6 +498,7 @@ function getCompareRows_(deviceIds) {
       battery_v_diff: diffNumber_(sheet && sheet.battery_v, supabase && supabase.battery_v),
       battery_charge_rate_diff: diffNumber_(sheet && sheet.battery_charge_rate, supabase && supabase.battery_charge_rate),
       weight_lbs_diff: diffNumber_(sheet && sheet.weight_lbs, supabase && supabase.weight_lbs),
+      filtered_weight_lbs_diff: diffNumber_(sheet && sheet.filtered_weight_lbs, supabase && supabase.filtered_weight_lbs),
       temperature_c_diff: diffNumber_(sheet && sheet.temperature_c, supabase && supabase.temperature_c),
       humidity_pct_diff: diffNumber_(sheet && sheet.humidity_pct, supabase && supabase.humidity_pct)
     };
@@ -516,10 +533,121 @@ function getSupabaseLatestRows_(deviceIds) {
   if (!Array.isArray(rows)) return [];
   return rows.map(row => {
     const weightValue = toNumOrNull_((row && row.weight_lbs) != null ? row.weight_lbs : (row && row.weight_kg));
+    const filteredWeightValue = toNumOrNull_(row && row.filtered_weight_lbs);
     return Object.assign({}, row, {
-      weight_lbs: weightValue
+      weight_lbs: weightValue,
+      filtered_weight_lbs: filteredWeightValue
     });
   });
+}
+
+function isLikelyStepJump_(rawWeight, lastAcceptedWeight, lastAcceptedTs, ts) {
+  if (!Number.isFinite(rawWeight) || !Number.isFinite(lastAcceptedWeight)) return false;
+  if (!(lastAcceptedTs instanceof Date) || Number.isNaN(lastAcceptedTs.getTime())) return false;
+  if (!(ts instanceof Date) || Number.isNaN(ts.getTime())) return false;
+
+  const dtMin = Math.max(0.1, (ts.getTime() - lastAcceptedTs.getTime()) / 60000);
+  const maxStep = (WEIGHT_FILTER_MAX_RATE_LB_PER_MIN * dtMin) + WEIGHT_FILTER_STEP_MARGIN_LB;
+  return Math.abs(rawWeight - lastAcceptedWeight) > maxStep;
+}
+
+function updateFilteredWeightState_(weightLbs, tsIso, prev) {
+  const parsedWeight = Number(weightLbs);
+  let effectiveWeight = parsedWeight;
+  const ts = new Date(String(tsIso || ""));
+  if (!Number.isFinite(parsedWeight) || !(ts instanceof Date) || Number.isNaN(ts.getTime())) {
+    return {
+      filtered: null,
+      state: {
+        fw_last_filtered: prev.fw_last_filtered ?? null,
+        fw_last_accepted_raw: prev.fw_last_accepted_raw ?? null,
+        fw_last_accepted_ts: prev.fw_last_accepted_ts ?? null,
+        fw_candidate_value: prev.fw_candidate_value ?? null,
+        fw_candidate_started_ts: prev.fw_candidate_started_ts ?? null,
+        fw_candidate_count: prev.fw_candidate_count ?? 0
+      }
+    };
+  }
+
+  let lastFiltered = toNumOrNull_(prev.fw_last_filtered);
+  let lastAcceptedRaw = toNumOrNull_(prev.fw_last_accepted_raw);
+  const lastAcceptedTs = new Date(String(prev.fw_last_accepted_ts || ""));
+
+  let candidateValue = toNumOrNull_(prev.fw_candidate_value);
+  let candidateStartedTs = new Date(String(prev.fw_candidate_started_ts || ""));
+  let candidateCount = Number(prev.fw_candidate_count) || 0;
+
+  if (!(lastAcceptedTs instanceof Date) || Number.isNaN(lastAcceptedTs.getTime())) {
+    lastAcceptedRaw = null;
+  }
+  if (!(candidateStartedTs instanceof Date) || Number.isNaN(candidateStartedTs.getTime())) {
+    candidateValue = null;
+    candidateCount = 0;
+  }
+
+  let acceptNow = true;
+  let unlockedNow = false;
+  const isStepJump = isLikelyStepJump_(effectiveWeight, lastAcceptedRaw, lastAcceptedTs, ts);
+  if (isStepJump) {
+    acceptNow = false;
+
+    if (Number.isFinite(candidateValue) && candidateStartedTs instanceof Date && !Number.isNaN(candidateStartedTs.getTime())) {
+      if (Math.abs(effectiveWeight - candidateValue) <= WEIGHT_FILTER_CONSISTENCY_BAND_LB) {
+        candidateCount += 1;
+        candidateValue = (candidateValue * 0.7) + (effectiveWeight * 0.3);
+      } else {
+        candidateValue = effectiveWeight;
+        candidateStartedTs = ts;
+        candidateCount = 1;
+      }
+    } else {
+      candidateValue = effectiveWeight;
+      candidateStartedTs = ts;
+      candidateCount = 1;
+    }
+
+    const candidateMinutes = Math.max(0, (ts.getTime() - candidateStartedTs.getTime()) / 60000);
+    if (candidateCount >= WEIGHT_FILTER_UNLOCK_MIN_POINTS && candidateMinutes >= WEIGHT_FILTER_UNLOCK_MIN_MINUTES) {
+      acceptNow = true;
+      unlockedNow = true;
+      effectiveWeight = candidateValue;
+    }
+  } else {
+    candidateValue = null;
+    candidateStartedTs = null;
+    candidateCount = 0;
+  }
+
+  if (acceptNow) {
+    if (unlockedNow) {
+      // Once the candidate plateau is sustained long enough, shift baseline immediately.
+      lastFiltered = effectiveWeight;
+    } else if (lastFiltered == null || !Number.isFinite(lastFiltered) || !(lastAcceptedTs instanceof Date) || Number.isNaN(lastAcceptedTs.getTime())) {
+      lastFiltered = effectiveWeight;
+    } else {
+      const dtMin = Math.max(0.1, (ts.getTime() - lastAcceptedTs.getTime()) / 60000);
+      const alpha = 1 - Math.exp(-dtMin / WEIGHT_FILTER_EMA_TAU_MIN);
+      lastFiltered = (alpha * effectiveWeight) + ((1 - alpha) * lastFiltered);
+    }
+
+    lastAcceptedRaw = effectiveWeight;
+
+    candidateValue = null;
+    candidateStartedTs = null;
+    candidateCount = 0;
+  }
+
+  return {
+    filtered: Number.isFinite(lastFiltered) ? lastFiltered : null,
+    state: {
+      fw_last_filtered: Number.isFinite(lastFiltered) ? lastFiltered : null,
+      fw_last_accepted_raw: Number.isFinite(lastAcceptedRaw) ? lastAcceptedRaw : null,
+      fw_last_accepted_ts: acceptNow ? ts.toISOString() : (prev.fw_last_accepted_ts || null),
+      fw_candidate_value: Number.isFinite(candidateValue) ? candidateValue : null,
+      fw_candidate_started_ts: candidateStartedTs instanceof Date && !Number.isNaN(candidateStartedTs.getTime()) ? candidateStartedTs.toISOString() : null,
+      fw_candidate_count: candidateCount
+    }
+  };
 }
 
 function indexByDeviceId_(rows) {
@@ -654,10 +782,13 @@ function mergeWithLastKnownState_(incoming) {
     stayAwakeState = prev.stay_awake_for_update != null ? prev.stay_awake_for_update : null;
   }
 
+  const filteredState = updateFilteredWeightState_(incoming.weight_lbs ?? prev.weight_lbs ?? null, incoming.timestamp_iso, prev);
+
   const merged = {
     timestamp_iso: incoming.timestamp_iso,
     device_id: incoming.device_id || prev.device_id || "",
     weight_lbs: incoming.weight_lbs ?? incoming.weight_kg ?? prev.weight_lbs ?? prev.weight_kg ?? null,
+    filtered_weight_lbs: filteredState.filtered,
     battery_v: incoming.battery_v ?? prev.battery_v ?? null,
     battery_pct: incoming.battery_pct ?? prev.battery_pct ?? null,
     battery_charge_rate: incoming.battery_charge_rate ?? prev.battery_charge_rate ?? null,
@@ -666,7 +797,13 @@ function mergeWithLastKnownState_(incoming) {
     rapid_update_streak: rapidUpdateStreak,
     temperature_c: incoming.temperature_c ?? prev.temperature_c ?? null,
     humidity_pct: incoming.humidity_pct ?? prev.humidity_pct ?? null,
-    source: incoming.source || "arduino-cloud"
+    source: incoming.source || "arduino-cloud",
+    fw_last_filtered: filteredState.state.fw_last_filtered,
+    fw_last_accepted_raw: filteredState.state.fw_last_accepted_raw,
+    fw_last_accepted_ts: filteredState.state.fw_last_accepted_ts,
+    fw_candidate_value: filteredState.state.fw_candidate_value,
+    fw_candidate_started_ts: filteredState.state.fw_candidate_started_ts,
+    fw_candidate_count: filteredState.state.fw_candidate_count
   };
 
   props.setProperty(key, JSON.stringify(merged));
@@ -680,13 +817,19 @@ function getOrCreateSheet_() {
   let sh = ss.getSheetByName(SHEET_NAME);
   if (!sh) {
     sh = ss.insertSheet(SHEET_NAME);
-    sh.appendRow(["timestamp_iso", "device_id", "weight_lbs", "battery_v", "battery_pct", "battery_charge_rate", "battery_connected", "temperature_c", "humidity_pct", "source", "event_raw"]);
+    sh.appendRow(["timestamp_iso", "device_id", "weight_lbs", "filtered_weight_lbs", "battery_v", "battery_pct", "battery_charge_rate", "battery_connected", "temperature_c", "humidity_pct", "source", "event_raw"]);
   }
 
   // One-time header rename keeps Sheets aligned with lbs semantics.
   const headerWeightName = String(sh.getRange(1, 3).getValue() || "").trim().toLowerCase();
   if (headerWeightName === "weight_kg") {
     sh.getRange(1, 3).setValue("weight_lbs");
+  }
+
+  const headerFilteredWeightName = String(sh.getRange(1, 4).getValue() || "").trim().toLowerCase();
+  if (headerFilteredWeightName !== "filtered_weight_lbs") {
+    sh.insertColumnAfter(3);
+    sh.getRange(1, 4).setValue("filtered_weight_lbs");
   }
 
   return sh;
@@ -697,6 +840,7 @@ function upsertTelemetryRow_(sh, merged, raw) {
     merged.timestamp_iso,
     merged.device_id || "",
     merged.weight_lbs ?? "",
+    merged.filtered_weight_lbs ?? "",
     merged.battery_v ?? "",
     merged.battery_pct ?? "",
     merged.battery_charge_rate ?? "",
@@ -713,7 +857,7 @@ function upsertTelemetryRow_(sh, merged, raw) {
     return;
   }
 
-  const last = sh.getRange(lastRow, 1, 1, 11).getValues()[0];
+  const last = sh.getRange(lastRow, 1, 1, 12).getValues()[0];
   const lastTs = new Date(last[0]);
   const currentTs = new Date(merged.timestamp_iso);
   const lastDevice = String(last[1] || "");
@@ -728,7 +872,7 @@ function upsertTelemetryRow_(sh, merged, raw) {
     Math.abs(currentTs.getTime() - lastTs.getTime()) <= DEDUPE_WINDOW_MS;
 
   if (canDedupe) {
-    sh.getRange(lastRow, 1, 1, 11).setValues([rowValues]);
+    sh.getRange(lastRow, 1, 1, 12).setValues([rowValues]);
     return;
   }
 
@@ -792,6 +936,7 @@ function writeSupabaseBestEffort_(merged, raw) {
     ts: merged.timestamp_iso,
     device_id: deviceId,
     weight_lbs: merged.weight_lbs,
+    filtered_weight_lbs: merged.filtered_weight_lbs,
     battery_v: merged.battery_v,
     battery_pct: merged.battery_pct,
     battery_charge_rate: merged.battery_charge_rate,
@@ -806,6 +951,7 @@ function writeSupabaseBestEffort_(merged, raw) {
     device_id: deviceId,
     ts: merged.timestamp_iso,
     weight_lbs: merged.weight_lbs,
+    filtered_weight_lbs: merged.filtered_weight_lbs,
     battery_v: merged.battery_v,
     battery_pct: merged.battery_pct,
     battery_charge_rate: merged.battery_charge_rate,
@@ -990,8 +1136,8 @@ function upsertSupabaseLatest_(cfg, payload, headers) {
  * Clears only weight values while preserving every row and all non-weight data.
  *
  * Targets:
- * - Google Sheet column C (weight_lbs) for all data rows in SHEET_NAME.
- * - Supabase public.telemetry_raw.weight_lbs and public.telemetry_latest.weight_lbs.
+ * - Google Sheet columns C/D (weight_lbs + filtered_weight_lbs) for all data rows in SHEET_NAME.
+ * - Supabase public.telemetry_raw/telemetry_latest weight_lbs + filtered_weight_lbs.
  *
  * Safe to run multiple times.
  */
@@ -1000,7 +1146,8 @@ function clearWeightDataOnly() {
     ok: true,
     sheet: {
       rows_total: 0,
-      weight_cells_cleared: 0
+      weight_cells_cleared: 0,
+      filtered_weight_cells_cleared: 0
     },
     supabase: {
       attempted: false,
@@ -1021,9 +1168,17 @@ function clearWeightDataOnly() {
       if (String(r[0] || "").trim() !== "") nonEmpty++;
     }
 
+    const filteredValues = sh.getRange(2, 4, numRows, 1).getValues();
+    let filteredNonEmpty = 0;
+    for (const r of filteredValues) {
+      if (String(r[0] || "").trim() !== "") filteredNonEmpty++;
+    }
+
     sh.getRange(2, 3, numRows, 1).clearContent();
+    sh.getRange(2, 4, numRows, 1).clearContent();
     result.sheet.rows_total = numRows;
     result.sheet.weight_cells_cleared = nonEmpty;
+    result.sheet.filtered_weight_cells_cleared = filteredNonEmpty;
   }
 
   const cfg = getSupabaseAdminConfig_();
@@ -1059,6 +1214,24 @@ function clearWeightDataOnly() {
   });
   result.supabase.telemetry_latest_status = Number(latestRes.getResponseCode());
 
+  const rawFilteredRes = UrlFetchApp.fetch(cfg.url + "/rest/v1/telemetry_raw?filtered_weight_lbs=not.is.null", {
+    method: "patch",
+    contentType: "application/json",
+    muteHttpExceptions: true,
+    headers: baseHeaders,
+    payload: JSON.stringify({ filtered_weight_lbs: null })
+  });
+  result.supabase.telemetry_raw_filtered_status = Number(rawFilteredRes.getResponseCode());
+
+  const latestFilteredRes = UrlFetchApp.fetch(cfg.url + "/rest/v1/telemetry_latest?filtered_weight_lbs=not.is.null", {
+    method: "patch",
+    contentType: "application/json",
+    muteHttpExceptions: true,
+    headers: baseHeaders,
+    payload: JSON.stringify({ filtered_weight_lbs: null })
+  });
+  result.supabase.telemetry_latest_filtered_status = Number(latestFilteredRes.getResponseCode());
+
   // Optional legacy cleanup for projects that still use weight_kg.
   const legacyRes = UrlFetchApp.fetch(cfg.url + "/rest/v1/telemetry_raw?weight_kg=not.is.null", {
     method: "patch",
@@ -1071,10 +1244,12 @@ function clearWeightDataOnly() {
 
   const rawOk = result.supabase.telemetry_raw_status >= 200 && result.supabase.telemetry_raw_status < 300;
   const latestOk = result.supabase.telemetry_latest_status >= 200 && result.supabase.telemetry_latest_status < 300;
+  const rawFilteredOk = result.supabase.telemetry_raw_filtered_status >= 200 && result.supabase.telemetry_raw_filtered_status < 300;
+  const latestFilteredOk = result.supabase.telemetry_latest_filtered_status >= 200 && result.supabase.telemetry_latest_filtered_status < 300;
   const legacyOk = result.supabase.legacy_weight_kg_status >= 200 && result.supabase.legacy_weight_kg_status < 300;
   const legacyIgnored = result.supabase.legacy_weight_kg_status === 400 || result.supabase.legacy_weight_kg_status === 404;
 
-  result.ok = rawOk && latestOk && (legacyOk || legacyIgnored);
+  result.ok = rawOk && latestOk && rawFilteredOk && latestFilteredOk && (legacyOk || legacyIgnored);
   if (!result.ok) {
     result.supabase.warning = "supabase_weight_clear_incomplete";
   }
@@ -1111,7 +1286,7 @@ function backfillSheetDataToSupabase() {
 
   const numRows = lastRow - 1; // header is row 1
   Logger.log("Reading %s rows from sheet…", numRows);
-  const values = sh.getRange(2, 1, numRows, 11).getValues();
+  const values = sh.getRange(2, 1, numRows, 12).getValues();
 
   const baseHeaders = {
     apikey: cfg.key,
@@ -1148,26 +1323,27 @@ function backfillSheetDataToSupabase() {
       const deviceId = String(r[1] || "").trim();
       if (!deviceId) continue;
 
-      // event_raw (col K) is stored as a JSON string in Sheets
+      // event_raw (col L) is stored as a JSON string in Sheets
       let eventRaw = null;
       try {
-        const rawStr = String(r[10] || "").trim();
+        const rawStr = String(r[11] || "").trim();
         eventRaw = rawStr ? JSON.parse(rawStr) : null;
       } catch (ignored) {
-        eventRaw = r[10] ? { raw: String(r[10]).slice(0, 1000) } : null;
+        eventRaw = r[11] ? { raw: String(r[11]).slice(0, 1000) } : null;
       }
 
       payloads.push({
         ts: tsIso,
         device_id: deviceId,
         weight_lbs: toNumOrNull_(r[2]),
-        battery_v: toNumOrNull_(r[3]),
-        battery_pct: toNumOrNull_(r[4]),
-        battery_charge_rate: toNumOrNull_(r[5]),
-        battery_connected: r[6] === "" ? null : Boolean(r[6]),
-        temperature_c: toNumOrNull_(r[7]),
-        humidity_pct: toNumOrNull_(r[8]),
-        source: String(r[9] || "arduino-cloud") || "arduino-cloud",
+        filtered_weight_lbs: toNumOrNull_(r[3]),
+        battery_v: toNumOrNull_(r[4]),
+        battery_pct: toNumOrNull_(r[5]),
+        battery_charge_rate: toNumOrNull_(r[6]),
+        battery_connected: r[7] === "" ? null : Boolean(r[7]),
+        temperature_c: toNumOrNull_(r[8]),
+        humidity_pct: toNumOrNull_(r[9]),
+        source: String(r[10] || "arduino-cloud") || "arduino-cloud",
         event_raw: eventRaw
       });
     }
@@ -1214,13 +1390,314 @@ function backfillSheetDataToSupabase() {
   return result;
 }
 
+/**
+ * Recomputes filtered_weight_lbs for historical data using the current filter implementation.
+ *
+ * @param {string=} target Optional: "all" (default), "sheets", or "supabase".
+ * @param {string=} deviceIdsCsv Optional comma-separated device_id list.
+ */
+function recomputeFilteredWeightHistory(target, deviceIdsCsv) {
+  const mode = String(target || "all").trim().toLowerCase();
+  const applySheets = mode === "all" || mode === "sheets";
+  const applySupabase = mode === "all" || mode === "supabase";
+  const deviceIds = parseDeviceIds_(deviceIdsCsv || "");
+  const wanted = deviceIds.length ? new Set(deviceIds) : null;
+
+  const result = {
+    ok: true,
+    mode: mode || "all",
+    device_ids: deviceIds,
+    sheets: null,
+    supabase: null,
+    warning: ""
+  };
+
+  if (applySheets) {
+    result.sheets = recomputeFilteredWeightInSheet_(wanted);
+    if (!result.sheets.ok) result.ok = false;
+  }
+
+  if (applySupabase) {
+    result.supabase = recomputeFilteredWeightInSupabase_(wanted);
+    if (!result.supabase.ok) result.ok = false;
+  }
+
+  if (!applySheets && !applySupabase) {
+    result.ok = false;
+    result.warning = "invalid_target";
+  }
+
+  Logger.log("recomputeFilteredWeightHistory result: %s", JSON.stringify(result));
+  return result;
+}
+
+function recomputeFilteredWeightInSheet_(wantedDeviceIds) {
+  const sh = getOrCreateSheet_();
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) {
+    return { ok: true, rows_total: 0, rows_updated: 0, devices_updated: 0 };
+  }
+
+  const numRows = lastRow - 1;
+  const values = sh.getRange(2, 1, numRows, 12).getValues();
+  const rows = [];
+
+  for (let i = 0; i < values.length; i++) {
+    const r = values[i];
+    const deviceId = String(r[1] || "").trim();
+    if (!deviceId) continue;
+    if (wantedDeviceIds && !wantedDeviceIds.has(deviceId)) continue;
+
+    const tsRaw = r[0];
+    const tsIso = normalizeIso_(tsRaw);
+    if (!tsIso) continue;
+
+    rows.push({
+      idx: i,
+      device_id: deviceId,
+      timestamp_iso: tsIso,
+      ts_ms: Date.parse(tsIso),
+      weight_lbs: toNumOrNull_(r[2])
+    });
+  }
+
+  rows.sort((a, b) => {
+    if (a.device_id < b.device_id) return -1;
+    if (a.device_id > b.device_id) return 1;
+    if (a.ts_ms < b.ts_ms) return -1;
+    if (a.ts_ms > b.ts_ms) return 1;
+    return a.idx - b.idx;
+  });
+
+  const filteredCol = values.map(r => [r[3]]);
+  const stateByDevice = {};
+  const latestByDevice = {};
+  let updated = 0;
+
+  for (const row of rows) {
+    const did = row.device_id;
+    const prevState = stateByDevice[did] || {};
+    const next = updateFilteredWeightState_(row.weight_lbs, row.timestamp_iso, prevState);
+    stateByDevice[did] = next.state;
+    latestByDevice[did] = {
+      timestamp_iso: row.timestamp_iso,
+      weight_lbs: row.weight_lbs,
+      filtered_weight_lbs: next.filtered,
+      state: next.state
+    };
+
+    filteredCol[row.idx] = [next.filtered == null ? "" : next.filtered];
+    updated += 1;
+  }
+
+  sh.getRange(2, 4, numRows, 1).setValues(filteredCol);
+  persistFilterStateFromLatest_(latestByDevice);
+
+  return {
+    ok: true,
+    rows_total: numRows,
+    rows_recomputed: rows.length,
+    rows_updated: updated,
+    devices_updated: Object.keys(latestByDevice).length
+  };
+}
+
+function recomputeFilteredWeightInSupabase_(wantedDeviceIds) {
+  const cfg = getSupabaseAdminConfig_();
+  if (!cfg.enabled) {
+    return { ok: false, warning: "supabase_not_configured", rows_recomputed: 0, devices_updated: 0 };
+  }
+
+  const headers = {
+    apikey: cfg.key,
+    Authorization: "Bearer " + cfg.key,
+    Prefer: "resolution=merge-duplicates,return=minimal",
+    "User-Agent": "the-hive-appscript/1.0",
+    "X-Client-Info": "the-hive-appscript/1.0"
+  };
+
+  const allRows = fetchAllSupabaseRowsForRecompute_(cfg, wantedDeviceIds);
+  if (!allRows.length) {
+    return { ok: true, rows_recomputed: 0, devices_updated: 0, write_batches: 0 };
+  }
+
+  const stateByDevice = {};
+  const latestByDevice = {};
+  const updates = [];
+
+  for (const row of allRows) {
+    const did = String(row.device_id || "").trim();
+    if (!did) continue;
+
+    const prevState = stateByDevice[did] || {};
+    const next = updateFilteredWeightState_(toNumOrNull_(row.weight_lbs), row.ts, prevState);
+    stateByDevice[did] = next.state;
+    latestByDevice[did] = {
+      timestamp_iso: row.ts,
+      weight_lbs: toNumOrNull_(row.weight_lbs),
+      filtered_weight_lbs: next.filtered,
+      state: next.state
+    };
+
+    updates.push({
+      device_id: did,
+      ts: row.ts,
+      filtered_weight_lbs: next.filtered
+    });
+  }
+
+  const BATCH = 500;
+  let writeBatches = 0;
+  for (let i = 0; i < updates.length; i += BATCH) {
+    const batch = updates.slice(i, i + BATCH);
+    const res = UrlFetchApp.fetch(cfg.url + "/rest/v1/telemetry_raw?on_conflict=device_id,ts", {
+      method: "post",
+      contentType: "application/json",
+      muteHttpExceptions: true,
+      headers: headers,
+      payload: JSON.stringify(batch)
+    });
+
+    const code = Number(res.getResponseCode());
+    if (code < 200 || code >= 300) {
+      return {
+        ok: false,
+        warning: "supabase_raw_recompute_failed",
+        status: code,
+        error: String(res.getContentText() || "").slice(0, 300),
+        rows_recomputed: updates.length,
+        devices_updated: Object.keys(latestByDevice).length,
+        write_batches: writeBatches
+      };
+    }
+
+    writeBatches += 1;
+  }
+
+  let latestPatches = 0;
+  for (const did of Object.keys(latestByDevice)) {
+    const latest = latestByDevice[did];
+    const res = UrlFetchApp.fetch(cfg.url + "/rest/v1/telemetry_latest?device_id=eq." + encodeURIComponent(did), {
+      method: "patch",
+      contentType: "application/json",
+      muteHttpExceptions: true,
+      headers: {
+        apikey: cfg.key,
+        Authorization: "Bearer " + cfg.key,
+        Prefer: "return=minimal",
+        "User-Agent": "the-hive-appscript/1.0",
+        "X-Client-Info": "the-hive-appscript/1.0"
+      },
+      payload: JSON.stringify({ filtered_weight_lbs: latest.filtered_weight_lbs })
+    });
+
+    const code = Number(res.getResponseCode());
+    if (code >= 200 && code < 300) {
+      latestPatches += 1;
+    }
+  }
+
+  persistFilterStateFromLatest_(latestByDevice);
+
+  return {
+    ok: true,
+    rows_recomputed: updates.length,
+    devices_updated: Object.keys(latestByDevice).length,
+    write_batches: writeBatches,
+    latest_rows_patched: latestPatches
+  };
+}
+
+function fetchAllSupabaseRowsForRecompute_(cfg, wantedDeviceIds) {
+  const out = [];
+  const PAGE = 1000;
+  let offset = 0;
+
+  while (true) {
+    const queryParts = [
+      "select=" + encodeURIComponent("ts,device_id,weight_lbs"),
+      "order=" + encodeURIComponent("device_id.asc,ts.asc"),
+      "limit=" + encodeURIComponent(String(PAGE)),
+      "offset=" + encodeURIComponent(String(offset))
+    ];
+
+    if (wantedDeviceIds && wantedDeviceIds.size) {
+      const encoded = Array.from(wantedDeviceIds).map(id => '"' + String(id).replace(/"/g, "") + '"').join(",");
+      queryParts.push("device_id=" + encodeURIComponent("in.(" + encoded + ")"));
+    }
+
+    const res = UrlFetchApp.fetch(cfg.url + "/rest/v1/telemetry_raw?" + queryParts.join("&"), {
+      method: "get",
+      muteHttpExceptions: true,
+      headers: {
+        apikey: cfg.key,
+        Authorization: "Bearer " + cfg.key,
+        "User-Agent": "the-hive-appscript/1.0",
+        "X-Client-Info": "the-hive-appscript/1.0"
+      }
+    });
+
+    const code = Number(res.getResponseCode());
+    if (code < 200 || code >= 300) break;
+
+    const rows = JSON.parse(String(res.getContentText() || "[]"));
+    if (!Array.isArray(rows) || !rows.length) break;
+
+    out.push.apply(out, rows);
+    if (rows.length < PAGE) break;
+    offset += rows.length;
+  }
+
+  return out;
+}
+
+function normalizeIso_(value) {
+  if (!value) return null;
+  if (value instanceof Date) {
+    if (isNaN(value.getTime())) return null;
+    return value.toISOString();
+  }
+
+  const text = String(value).trim();
+  if (!text) return null;
+  const d = new Date(text);
+  if (!isNaN(d.getTime())) return d.toISOString();
+  return null;
+}
+
+function persistFilterStateFromLatest_(latestByDevice) {
+  const props = PropertiesService.getScriptProperties();
+
+  Object.keys(latestByDevice || {}).forEach(did => {
+    const key = "last_state_" + did;
+    const latest = latestByDevice[did] || {};
+    const prev = JSON.parse(props.getProperty(key) || "{}");
+    const state = latest.state || {};
+
+    const merged = Object.assign({}, prev, {
+      device_id: did,
+      timestamp_iso: latest.timestamp_iso || prev.timestamp_iso || null,
+      weight_lbs: latest.weight_lbs ?? prev.weight_lbs ?? null,
+      filtered_weight_lbs: latest.filtered_weight_lbs ?? prev.filtered_weight_lbs ?? null,
+      fw_last_filtered: state.fw_last_filtered ?? prev.fw_last_filtered ?? null,
+      fw_last_accepted_raw: state.fw_last_accepted_raw ?? prev.fw_last_accepted_raw ?? null,
+      fw_last_accepted_ts: state.fw_last_accepted_ts ?? prev.fw_last_accepted_ts ?? null,
+      fw_candidate_value: state.fw_candidate_value ?? prev.fw_candidate_value ?? null,
+      fw_candidate_started_ts: state.fw_candidate_started_ts ?? prev.fw_candidate_started_ts ?? null,
+      fw_candidate_count: state.fw_candidate_count ?? prev.fw_candidate_count ?? 0
+    });
+
+    props.setProperty(key, JSON.stringify(merged));
+  });
+}
+
 // ── Debug helper (run from editor to test sheet access) ──────────────────────
 
 function testWrite() {
   const sh = getOrCreateSheet_();
   Logger.log("Sheet found: " + sh.getName());
   Logger.log("Last row: " + sh.getLastRow());
-  sh.appendRow(["TEST", "debug", 99, 4.2, 100, 0.5, true, 24.5, 55.0, "test", "debug-payload"]);
+  sh.appendRow(["TEST", "debug", 99, 99, 4.2, 100, 0.5, true, 24.5, 55.0, "test", "debug-payload"]);
   Logger.log("Row appended!");
 }
 
@@ -1341,4 +1818,11 @@ function getSupabaseAdminConfig_() {
     url: urlRaw.replace(/\/+$/, ""),
     key: keyRaw
   };
+}
+
+function isAuthorizedAdminRequest_(e) {
+  const key = (e.parameter && e.parameter.key) ? String(e.parameter.key) : "";
+  if (key && key === SHARED_SECRET) return true;
+  const adminKey = String(PropertiesService.getScriptProperties().getProperty(HIVE_CONFIG_ADMIN_PROP_KEY) || "").trim();
+  return Boolean(adminKey) && key === adminKey;
 }

@@ -4,6 +4,32 @@ const LIVE_TIMEOUT_MS = 15 * 60 * 1000;
 const INVALID_CALIBRATION_WEIGHT_SENTINEL = -1234.5;
 const INVALID_CALIBRATION_WEIGHT_EPS = 0.01;
 
+const OVERVIEW_PROFILE = (() => {
+  try {
+    if (typeof window !== "undefined" && window.OVERVIEW_PROFILE === true) return true;
+    if (typeof localStorage !== "undefined" && localStorage.getItem("hive:overviewProfile") === "1") return true;
+    if (typeof location !== "undefined") {
+      const params = new URLSearchParams(location.search || "");
+      if (params.get("profile") === "1") return true;
+    }
+  } catch (err) {
+    // Profiling must never break runtime behavior.
+  }
+  return false;
+})();
+
+function profileStart_(label) {
+  if (!OVERVIEW_PROFILE || typeof performance === "undefined") return null;
+  return { label, t0: performance.now() };
+}
+
+function profileEnd_(token, extra) {
+  if (!token || !OVERVIEW_PROFILE || typeof performance === "undefined") return;
+  const ms = performance.now() - token.t0;
+  const detail = extra ? ` ${extra}` : "";
+  console.log(`[overview-prof] ${token.label}: ${ms.toFixed(1)}ms${detail}`);
+}
+
 function isInvalidCalibrationWeight_(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return false;
@@ -23,7 +49,20 @@ function getHivesConfig_() {
   return Array.isArray(HIVES_CONFIG) ? HIVES_CONFIG : [];
 }
 
+function getConfigSignature_(hives) {
+  return (Array.isArray(hives) ? hives : []).map(hive => [
+    String(hive && hive.id || ""),
+    String(hive && hive.label || ""),
+    String(hive && hive.icon || ""),
+    String(hive && hive.device_id || ""),
+    String(hive && hive.location || ""),
+    String(Boolean(hive && hive.active))
+  ].join("|")).join("||");
+}
+
 async function ensureConfiguredHivesLoaded_() {
+  const p = profileStart_("config_sync_total");
+  const beforeSig = getConfigSignature_(configuredHives);
   if (typeof loadConfiguredHives === "function") {
     try {
       await loadConfiguredHives(false);
@@ -32,12 +71,16 @@ async function ensureConfiguredHivesLoaded_() {
     }
   }
   configuredHives = getHivesConfig_();
+  const changed = getConfigSignature_(configuredHives) !== beforeSig;
+  profileEnd_(p, `changed=${changed}`);
+  return changed;
 }
 
 let configuredHives = getHivesConfig_();
 let lastByDevice = {};
 
 async function fetchLatestPerDevice() {
+  const p = profileStart_("fetch_latest_total");
   const useSupabase = DATA_SOURCE !== "appscript";
   let rows = [];
 
@@ -49,7 +92,9 @@ async function fetchLatestPerDevice() {
     const deviceIds = configuredHives
       .map(hive => hive.device_id)
       .filter(Boolean);
+    if (!deviceIds.length) return {};
     const url = `${SUPABASE_URL.replace(/\/$/, "")}/rest/v1/rpc/get_latest`;
+    const reqP = profileStart_("fetch_latest_request_supabase");
     const res = await fetch(url, {
       method: "POST",
       cache: "no-store",
@@ -60,20 +105,25 @@ async function fetchLatestPerDevice() {
       },
       body: JSON.stringify({ p_device_ids: deviceIds }),
     });
+    profileEnd_(reqP, `status=${res.status}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    rows = (await res.json() || []).map(r => ({ ...r, ts: new Date(r.timestamp_iso) }));
+    rows = (await res.json() || []).map(r => ({ ...r, ts: new Date(r.timestamp_iso || r.ts) }));
   } else {
     const deviceIds = configuredHives
       .map(hive => hive.device_id)
       .filter(Boolean)
       .join(",");
-    const url = `${API_URL}?mode=latest&device_ids=${encodeURIComponent(deviceIds)}&scan_limit=500`;
-    const res = await fetch(url, { cache: "default" });
+    const url = `${API_URL}?mode=latest&device_ids=${encodeURIComponent(deviceIds)}&scan_limit=500&_=${Date.now()}`;
+    const reqP = profileStart_("fetch_latest_request_appscript");
+    const res = await fetch(url, { cache: "no-store" });
+    profileEnd_(reqP, `status=${res.status}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const json = await res.json();
     if (!json.ok) throw new Error(json.error || "API returned ok:false");
     rows = (json.rows || []).map(r => ({ ...r, ts: new Date(r.timestamp_iso) }));
   }
+
+  profileEnd_(p, `rows=${rows.length}`);
 
   // Group by device_id, keep only the latest row per device
   const byDevice = {};
@@ -135,10 +185,15 @@ function buildCard(hive, latest) {
     : null;
 
   const weightLbs = hasData ? getWeightLbs_(latest) : null;
+  const filteredWeightLbs = hasData && Number.isFinite(Number(latest.filtered_weight_lbs))
+    ? Number(latest.filtered_weight_lbs)
+    : null;
   const hasInvalidWeight = hasData && isInvalidCalibrationWeight_(weightLbs);
   const weight = hasInvalidWeight
     ? "Calibrate scale"
-    : (weightLbs != null ? weightLbs.toFixed(2) : null);
+    : ((filteredWeightLbs != null ? filteredWeightLbs : weightLbs) != null
+      ? (filteredWeightLbs != null ? filteredWeightLbs : weightLbs).toFixed(2)
+      : null);
   const pct    = hasData && latest.battery_pct != null ? latest.battery_pct.toFixed(1) : null;
   const volts  = hasData && latest.battery_v != null ? latest.battery_v.toFixed(3) : null;
   const rate   = hasData && latest.battery_charge_rate != null ? latest.battery_charge_rate.toFixed(1) : null;
@@ -251,6 +306,7 @@ function updateWebhookStaleBanner(byDevice) {
 }
 
 async function refreshOverview() {
+  const p = profileStart_("refresh_total");
   const btn = document.getElementById("refresh-btn");
   const errBanner = document.getElementById("error-banner");
   btn.disabled = true;
@@ -260,13 +316,16 @@ async function refreshOverview() {
     if (!Object.keys(lastByDevice).length) {
       renderOverviewLoading("Loading hives...");
     }
-    await ensureConfiguredHivesLoaded_();
+    const fetchP = profileStart_("refresh_fetch_latest");
     const byDevice = await fetchLatestPerDevice();
+    profileEnd_(fetchP, `devices=${Object.keys(byDevice || {}).length}`);
     lastByDevice = byDevice;
     errBanner.classList.add("hidden");
 
+    const renderP = profileStart_("refresh_render");
     renderOverviewGrid(byDevice);
     updateWebhookStaleBanner(byDevice);
+    profileEnd_(renderP);
 
     document.getElementById("last-updated").textContent =
       "Updated " + new Date().toLocaleTimeString();
@@ -276,12 +335,23 @@ async function refreshOverview() {
   } finally {
     btn.disabled = false;
     btn.textContent = "↻ Refresh";
+    profileEnd_(p);
   }
 }
 
 // Auto-refresh
 initOverviewConfigEditor();
 renderOverviewLoading("Loading hives...");
-ensureConfiguredHivesLoaded_().then(() => refreshOverview()).then(() => {
+refreshOverview();
+
+// Sync server-side hive config in the background so a slow config endpoint
+// does not block first paint or manual refresh latency.
+ensureConfiguredHivesLoaded_().then((changed) => {
+  if (changed) {
+    renderOverviewGrid(lastByDevice);
+    updateWebhookStaleBanner(lastByDevice);
+    refreshOverview();
+  }
+}).finally(() => {
   setInterval(refreshOverview, AUTO_REFRESH_MS);
 });
