@@ -82,6 +82,8 @@ const EST_LATEST_DECAY_HOURS = 0.7;
 const EST_FALLBACK_NEAREST_SEGMENTS = 8;
 const WEIGHT_NO_DATA_DEFAULT_TEXT = "No weight data yet — add a weight sensor to your Arduino Thing to enable this chart.";
 const WEIGHT_NEEDS_CALIBRATION_TEXT = "Scale not calibrated yet. In IoT Cloud, run Tare with empty hive, then Calibrate with a known weight.";
+const WEIGHT_SENSOR_FAILURE_TIMEOUT_MS = 60 * 60 * 1000;
+const WEIGHT_SENSOR_FAILURE_TEXT = "Sensor read failure";
 
 function isInvalidCalibrationWeight_(value) {
   const n = Number(value);
@@ -572,6 +574,43 @@ function formatDuration(hours) {
   return `${mins}m`;
 }
 
+function getWeightFailureState_(rows, weightCtx) {
+  if (!rows.length) {
+    return {
+      latestHasUsableWeight: false,
+      hasAnyValidWeight: false,
+      lastValidAgeMs: null,
+      showSensorFailure: false,
+    };
+  }
+
+  const latest = rows[rows.length - 1];
+  const latestRawWeight = getWeightLbs_(latest);
+  const latestFilteredWeight = getFilteredWeightLbs_(latest);
+  const latestHasUsableWeight = Number.isFinite(latestFilteredWeight)
+    || (latestRawWeight != null && !isInvalidCalibrationWeight_(latestRawWeight));
+
+  const latestTs = latest.ts instanceof Date && !Number.isNaN(latest.ts.getTime()) ? latest.ts : null;
+  const lastValidTs = weightCtx && Array.isArray(weightCtx.points) && weightCtx.points.length
+    ? weightCtx.points[weightCtx.points.length - 1].ts
+    : null;
+
+  const hasAnyValidWeight = lastValidTs instanceof Date && !Number.isNaN(lastValidTs.getTime());
+  const lastValidAgeMs = latestTs && hasAnyValidWeight
+    ? Math.max(0, latestTs.getTime() - lastValidTs.getTime())
+    : null;
+
+  const showSensorFailure = !latestHasUsableWeight
+    && (!hasAnyValidWeight || (lastValidAgeMs != null && lastValidAgeMs > WEIGHT_SENSOR_FAILURE_TIMEOUT_MS));
+
+  return {
+    latestHasUsableWeight,
+    hasAnyValidWeight,
+    lastValidAgeMs,
+    showSensorFailure,
+  };
+}
+
 function estimateShutdown(rows) {
   const points = getPctPoints(rows);
   if (!points.length) return { etaText: "—", etaDate: null, hoursLeft: null, rate: null };
@@ -627,11 +666,17 @@ function updateStats(rows, trendRows = rows, weightCtx = null) {
   const rawWeight = weightCtx && Number.isFinite(weightCtx.latestRawWeight)
     ? weightCtx.latestRawWeight
     : (weight != null ? Number(weight) : null);
+  const weightFailure = getWeightFailureState_(rows, weightCtx);
 
   if (isInvalidCalibrationWeight_(weight)) {
     statWeightEl.textContent = "Calibrate";
     statWeightEl.style.color = "var(--danger)";
     statWeightEl.setAttribute("title", "Scale not calibrated. Run tare, then calibrate with a known weight.");
+    if (statWeightRawEl) statWeightRawEl.textContent = "";
+  } else if (weightFailure.showSensorFailure) {
+    statWeightEl.textContent = "Sensor fail";
+    statWeightEl.style.color = "var(--danger)";
+    statWeightEl.setAttribute("title", WEIGHT_SENSOR_FAILURE_TEXT);
     if (statWeightRawEl) statWeightRawEl.textContent = "";
   } else {
     statWeightEl.textContent = filteredWeight != null ? filteredWeight.toFixed(2) : (rawWeight != null ? rawWeight.toFixed(2) : "—");
@@ -696,16 +741,32 @@ function layout(yTitle, extraY) {
 function renderWeightChart(rows, weightCtx) {
   const withWeight = weightCtx ? weightCtx.points : [];
   const hasInvalidWeight = weightCtx ? weightCtx.hasInvalidWeight : false;
+  const weightFailure = getWeightFailureState_(rows, weightCtx);
   const noDataMsg = document.getElementById("weight-no-data");
 
   if (!withWeight.length) {
-    noDataMsg.textContent = hasInvalidWeight ? WEIGHT_NEEDS_CALIBRATION_TEXT : WEIGHT_NO_DATA_DEFAULT_TEXT;
+    if (hasInvalidWeight) {
+      noDataMsg.textContent = WEIGHT_NEEDS_CALIBRATION_TEXT;
+    } else if (weightFailure.showSensorFailure) {
+      noDataMsg.textContent = WEIGHT_SENSOR_FAILURE_TEXT;
+    } else {
+      noDataMsg.textContent = WEIGHT_NO_DATA_DEFAULT_TEXT;
+    }
     noDataMsg.classList.remove("hidden");
     document.getElementById("chart-weight").style.display = "none";
     return;
   }
-  noDataMsg.textContent = WEIGHT_NO_DATA_DEFAULT_TEXT;
-  noDataMsg.classList.add("hidden");
+
+  if (weightFailure.showSensorFailure) {
+    const ageText = weightFailure.lastValidAgeMs != null
+      ? ` for ${formatDuration(weightFailure.lastValidAgeMs / 3600000)}`
+      : "";
+    noDataMsg.textContent = `${WEIGHT_SENSOR_FAILURE_TEXT}${ageText}. Showing last valid trend.`;
+    noDataMsg.classList.remove("hidden");
+  } else {
+    noDataMsg.textContent = WEIGHT_NO_DATA_DEFAULT_TEXT;
+    noDataMsg.classList.add("hidden");
+  }
   document.getElementById("chart-weight").style.display = "";
 
   const xRange = withWeight.length

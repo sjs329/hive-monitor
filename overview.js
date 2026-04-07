@@ -3,6 +3,7 @@
 const LIVE_TIMEOUT_MS = 15 * 60 * 1000;
 const INVALID_CALIBRATION_WEIGHT_SENTINEL = -1234.5;
 const INVALID_CALIBRATION_WEIGHT_EPS = 0.01;
+const WEIGHT_SENSOR_FAILURE_TIMEOUT_MS = 60 * 60 * 1000;
 
 const OVERVIEW_PROFILE = (() => {
   try {
@@ -78,6 +79,51 @@ async function ensureConfiguredHivesLoaded_() {
 
 let configuredHives = getHivesConfig_();
 let lastByDevice = {};
+let lastValidWeightByDevice = {};
+
+function resolveWeightDisplayState_(deviceId, latest) {
+  if (!latest || !deviceId) {
+    return { kind: "none", weight: null, ageMs: null };
+  }
+
+  const latestTs = latest.ts instanceof Date && !Number.isNaN(latest.ts.getTime())
+    ? latest.ts
+    : new Date();
+  const rawWeightLbs = getWeightLbs_(latest);
+  const filteredWeightLbs = Number.isFinite(Number(latest.filtered_weight_lbs))
+    ? Number(latest.filtered_weight_lbs)
+    : null;
+
+  if (isInvalidCalibrationWeight_(rawWeightLbs)) {
+    return { kind: "calibrate", weight: null, ageMs: null };
+  }
+
+  const liveWeight = filteredWeightLbs != null ? filteredWeightLbs : rawWeightLbs;
+  if (liveWeight != null && Number.isFinite(Number(liveWeight))) {
+    lastValidWeightByDevice[deviceId] = {
+      weight: Number(liveWeight),
+      lastValidTs: latestTs.toISOString(),
+    };
+    return { kind: "live", weight: Number(liveWeight), ageMs: 0 };
+  }
+
+  const cached = lastValidWeightByDevice[deviceId];
+  if (!cached || !Number.isFinite(Number(cached.weight))) {
+    return { kind: "failed", weight: null, ageMs: null };
+  }
+
+  const lastValidTs = new Date(String(cached.lastValidTs || ""));
+  if (!(lastValidTs instanceof Date) || Number.isNaN(lastValidTs.getTime())) {
+    return { kind: "failed", weight: null, ageMs: null };
+  }
+
+  const ageMs = Math.max(0, latestTs.getTime() - lastValidTs.getTime());
+  if (ageMs <= WEIGHT_SENSOR_FAILURE_TIMEOUT_MS) {
+    return { kind: "cached", weight: Number(cached.weight), ageMs };
+  }
+
+  return { kind: "failed", weight: null, ageMs };
+}
 
 async function fetchLatestPerDevice() {
   const p = profileStart_("fetch_latest_total");
@@ -184,16 +230,17 @@ function buildCard(hive, latest) {
     ? latest.ts.toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" })
     : null;
 
-  const weightLbs = hasData ? getWeightLbs_(latest) : null;
-  const filteredWeightLbs = hasData && Number.isFinite(Number(latest.filtered_weight_lbs))
-    ? Number(latest.filtered_weight_lbs)
-    : null;
-  const hasInvalidWeight = hasData && isInvalidCalibrationWeight_(weightLbs);
+  const weightState = hasData
+    ? resolveWeightDisplayState_(hive.device_id, latest)
+    : { kind: "none", weight: null, ageMs: null };
+  const hasInvalidWeight = weightState.kind === "calibrate";
+  const hasSensorFailure = weightState.kind === "failed";
+  const usingCachedWeight = weightState.kind === "cached";
   const weight = hasInvalidWeight
     ? "Calibrate scale"
-    : ((filteredWeightLbs != null ? filteredWeightLbs : weightLbs) != null
-      ? (filteredWeightLbs != null ? filteredWeightLbs : weightLbs).toFixed(2)
-      : null);
+    : hasSensorFailure
+      ? "Sensor fail"
+      : (weightState.weight != null ? Number(weightState.weight).toFixed(2) : null);
   const pct    = hasData && latest.battery_pct != null ? latest.battery_pct.toFixed(1) : null;
   const volts  = hasData && latest.battery_v != null ? latest.battery_v.toFixed(3) : null;
   const rate   = hasData && latest.battery_charge_rate != null ? latest.battery_charge_rate.toFixed(1) : null;
@@ -242,6 +289,8 @@ function buildCard(hive, latest) {
         <span class="hc-monitor-label">Monitor</span>
         <span class="hc-monitor-value">🔋 ${pct != null ? pct + "%" : "—"}</span>
       </div>
+      ${usingCachedWeight ? `<div class="hc-footer">Using last valid weight (${formatAge(weightState.ageMs || 0)} ago).</div>` : ""}
+      ${hasSensorFailure ? `<div class="hc-footer hc-footer--warn">Sensor read failures for ${weightState.ageMs != null ? formatAge(weightState.ageMs) : "a long time"}.</div>` : ""}
       ${hasInvalidWeight ? '<div class="hc-footer hc-footer--warn">Scale not calibrated. Run tare, then calibrate with a known weight.</div>' : ""}
       ${lastSeen ? `<div class="hc-footer">Last reading: ${lastSeen}</div>` : ""}
       <div class="hc-cta">View Details →</div>
