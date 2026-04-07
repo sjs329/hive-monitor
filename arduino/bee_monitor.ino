@@ -33,7 +33,9 @@
 #define DEBUG_SERIAL 0
 
 Adafruit_MAX17048 maxlipo;
-Adafruit_HX711 scale(5, 9); // DOUT=5, SCK=9
+const uint8_t HX711_DOUT_PIN = 5;
+const uint8_t HX711_SCK_PIN = 9;
+Adafruit_HX711 scale(HX711_DOUT_PIN, HX711_SCK_PIN);
 Preferences prefs;
 
 const uint64_t SLEEP_INTERVAL_US = 3ULL * 60ULL * 1000000ULL;
@@ -276,6 +278,11 @@ void stayAwakeMode() {
 }
 
 void enterDeepSleep() {
+  // HX711 enters low-power mode when PD_SCK is held HIGH for >60 us.
+  pinMode(HX711_SCK_PIN, OUTPUT);
+  digitalWrite(HX711_SCK_PIN, HIGH);
+  delayMicroseconds(80);
+
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   delay(20);
