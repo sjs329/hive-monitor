@@ -777,6 +777,7 @@ function updateStats(rows, trendRows = rows, weightCtx = null) {
 function layout(yTitle, extraY) {
   return {
     ...PLOTLY_LAYOUT_BASE,
+    uirevision: activeHours,
     yaxis: { ...PLOTLY_LAYOUT_BASE.yaxis, title: yTitle },
     ...(extraY || {})
   };
@@ -1080,6 +1081,7 @@ function renderTempHumidityChart(rows) {
     },
   ], {
     ...PLOTLY_LAYOUT_BASE,
+    uirevision: activeHours,
     yaxis:  { ...PLOTLY_LAYOUT_BASE.yaxis, title: "°C" },
     yaxis2: { title: "%", overlaying: "y", side: "right", gridcolor: "rgba(0,0,0,0)", zeroline: false },
   }, { responsive: true });
