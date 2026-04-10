@@ -66,6 +66,8 @@ let fullWeightCtx = null;
 const SHUTDOWN_PCT = 2;
 const INVALID_CALIBRATION_WEIGHT_SENTINEL = -1234.5;
 const INVALID_CALIBRATION_WEIGHT_EPS = 0.01;
+const RAW_SCALE_READ_FAILED_SENTINEL = -2147483000;
+const RAW_SCALE_READ_FAILED_EPS = 1000;
 const MIN_RATE_FOR_ETA = 0.05;
 const EST_MIN_POINTS = 4;
 const EST_HISTORY_WINDOW_HOURS = 2.25;
@@ -89,6 +91,12 @@ function isInvalidCalibrationWeight_(value) {
   const n = Number(value);
   if (!Number.isFinite(n)) return false;
   return Math.abs(n - INVALID_CALIBRATION_WEIGHT_SENTINEL) <= INVALID_CALIBRATION_WEIGHT_EPS;
+}
+
+function isRawScaleSensorError_(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return false;
+  return Math.abs(n - RAW_SCALE_READ_FAILED_SENTINEL) <= RAW_SCALE_READ_FAILED_EPS;
 }
 
 function getWeightLbs_(row) {
@@ -281,6 +289,19 @@ function buildWeightPlotContext_(rows) {
     }
   }
 
+  const rawCountsPoints = [];
+  const rawCountsErrorPoints = [];
+  let lastValidCounts = null;
+  for (const p of points) {
+    if (!Number.isFinite(p.rawCounts)) continue;
+    if (isRawScaleSensorError_(p.rawCounts)) {
+      rawCountsErrorPoints.push({ ts: p.ts, displayCounts: lastValidCounts });
+    } else {
+      rawCountsPoints.push(p);
+      lastValidCounts = p.rawCounts;
+    }
+  }
+
   return {
     points,
     filteredWeights,
@@ -288,7 +309,8 @@ function buildWeightPlotContext_(rows) {
     hasInvalidWeight: rows.some(r => isInvalidCalibrationWeight_(getWeightLbs_(r))),
     latestRawWeight,
     latestFilteredWeight,
-    rawCountsPoints: points.filter(p => Number.isFinite(p.rawCounts)),
+    rawCountsPoints,
+    rawCountsErrorPoints,
   };
 }
 
@@ -302,6 +324,7 @@ function sliceWeightPlotContextByHours_(weightCtx, hours) {
       latestRawWeight: null,
       latestFilteredWeight: null,
       rawCountsPoints: [],
+      rawCountsErrorPoints: [],
     };
   }
 
@@ -325,6 +348,26 @@ function sliceWeightPlotContextByHours_(weightCtx, hours) {
     }
   }
 
+  // Recompute raw counts split for the sliced window, carrying forward the
+  // last valid reading from before the cutoff so error markers get a y-value.
+  let lastValidCounts = null;
+  for (const p of weightCtx.points.slice(0, start)) {
+    if (Number.isFinite(p.rawCounts) && !isRawScaleSensorError_(p.rawCounts)) {
+      lastValidCounts = p.rawCounts;
+    }
+  }
+  const rawCountsPoints = [];
+  const rawCountsErrorPoints = [];
+  for (const p of slicedPoints) {
+    if (!Number.isFinite(p.rawCounts)) continue;
+    if (isRawScaleSensorError_(p.rawCounts)) {
+      rawCountsErrorPoints.push({ ts: p.ts, displayCounts: lastValidCounts });
+    } else {
+      rawCountsPoints.push(p);
+      lastValidCounts = p.rawCounts;
+    }
+  }
+
   return {
     points: slicedPoints,
     filteredWeights: slicedFiltered,
@@ -332,7 +375,8 @@ function sliceWeightPlotContextByHours_(weightCtx, hours) {
     hasInvalidWeight: weightCtx.hasInvalidWeight,
     latestRawWeight: slicedPoints.length ? slicedPoints[slicedPoints.length - 1].rawWeight : null,
     latestFilteredWeight,
-    rawCountsPoints: slicedPoints.filter(p => Number.isFinite(p.rawCounts)),
+    rawCountsPoints,
+    rawCountsErrorPoints,
   };
 }
 
@@ -733,6 +777,7 @@ function updateStats(rows, trendRows = rows, weightCtx = null) {
 function layout(yTitle, extraY) {
   return {
     ...PLOTLY_LAYOUT_BASE,
+    uirevision: activeHours,
     yaxis: { ...PLOTLY_LAYOUT_BASE.yaxis, title: yTitle },
     ...(extraY || {})
   };
@@ -854,8 +899,9 @@ function renderRawCountsChart_(rows, weightCtx) {
   if (!showRawCountsDebug) return;
 
   const rawPoints = (weightCtx && weightCtx.rawCountsPoints) || [];
+  const rawErrorPoints = (weightCtx && weightCtx.rawCountsErrorPoints) || [];
   const weightPoints = (weightCtx && weightCtx.points) || [];
-  if (!rawPoints.length) {
+  if (!rawPoints.length && !rawErrorPoints.length) {
     noData.classList.remove("hidden");
     chart.style.display = "none";
     return;
@@ -868,7 +914,7 @@ function renderRawCountsChart_(rows, weightCtx) {
     ? [weightPoints[0].ts, weightPoints[weightPoints.length - 1].ts]
     : undefined;
 
-  Plotly.react("chart-raw-counts", [{
+  const traces = [{
     x: rawPoints.map(p => p.ts),
     y: rawPoints.map(p => p.rawCounts),
     mode: "lines+markers",
@@ -876,7 +922,20 @@ function renderRawCountsChart_(rows, weightCtx) {
     line: { color: "#1f4f82", width: 2 },
     marker: { size: 3 },
     hovertemplate: "%{y:.0f} counts<extra></extra>",
-  }], {
+  }];
+
+  if (rawErrorPoints.length) {
+    traces.push({
+      x: rawErrorPoints.map(p => p.ts),
+      y: rawErrorPoints.map(p => p.displayCounts),
+      mode: "markers",
+      name: "Sensor read error",
+      marker: { symbol: "x", size: 10, color: "#c0392b", line: { width: 2, color: "#c0392b" } },
+      hovertemplate: "Sensor read error<extra></extra>",
+    });
+  }
+
+  Plotly.react("chart-raw-counts", traces, {
     ...layout("counts"),
     xaxis: { ...PLOTLY_LAYOUT_BASE.xaxis, range: xRange },
   }, { responsive: true });
@@ -1022,6 +1081,7 @@ function renderTempHumidityChart(rows) {
     },
   ], {
     ...PLOTLY_LAYOUT_BASE,
+    uirevision: activeHours,
     yaxis:  { ...PLOTLY_LAYOUT_BASE.yaxis, title: "°C" },
     yaxis2: { title: "%", overlaying: "y", side: "right", gridcolor: "rgba(0,0,0,0)", zeroline: false },
   }, { responsive: true });
