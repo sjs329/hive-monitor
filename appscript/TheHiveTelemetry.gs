@@ -555,14 +555,20 @@ function isLikelyStepJump_(rawWeight, lastAcceptedWeight, lastAcceptedTs, ts) {
 }
 
 function updateFilteredWeightState_(weightLbs, tsIso, prev) {
+  const hasWeightInput = !(
+    weightLbs === null
+    || weightLbs === undefined
+    || (typeof weightLbs === "string" && weightLbs.trim() === "")
+  );
   const parsedWeight = Number(weightLbs);
   let effectiveWeight = parsedWeight;
   const ts = new Date(String(tsIso || ""));
-  if (!Number.isFinite(parsedWeight) || !(ts instanceof Date) || Number.isNaN(ts.getTime())) {
+  if (!hasWeightInput || !Number.isFinite(parsedWeight) || !(ts instanceof Date) || Number.isNaN(ts.getTime())) {
+    const prevFiltered = toNumOrNull_(prev.fw_last_filtered);
     return {
-      filtered: null,
+      filtered: prevFiltered,
       state: {
-        fw_last_filtered: prev.fw_last_filtered ?? null,
+        fw_last_filtered: prevFiltered,
         fw_last_accepted_raw: prev.fw_last_accepted_raw ?? null,
         fw_last_accepted_ts: prev.fw_last_accepted_ts ?? null,
         fw_candidate_value: prev.fw_candidate_value ?? null,
@@ -1812,6 +1818,8 @@ function jsonText_(text) {
 }
 
 function toNumOrNull_(v) {
+  if (v === null || v === undefined) return null;
+  if (typeof v === "string" && v.trim() === "") return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 }
