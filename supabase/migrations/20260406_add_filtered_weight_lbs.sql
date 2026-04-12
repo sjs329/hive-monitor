@@ -3,6 +3,9 @@
 alter table if exists public.telemetry_raw
   add column if not exists filtered_weight_lbs double precision;
 
+alter table if exists public.telemetry_raw
+  add column if not exists raw_scale_counts double precision;
+
 alter table if exists public.telemetry_latest
   add column if not exists filtered_weight_lbs double precision;
 
@@ -108,6 +111,8 @@ returns table (
   device_id text,
   weight_lbs double precision,
   filtered_weight_lbs double precision,
+  raw_scale_counts double precision,
+  raw_scale_error_samples integer,
   battery_v double precision,
   battery_pct double precision,
   battery_charge_rate double precision,
@@ -132,6 +137,15 @@ as $$
       device_id,
       avg(weight_lbs) as weight_lbs,
       avg(filtered_weight_lbs) as filtered_weight_lbs,
+      avg(case
+        when raw_scale_counts is null then null
+        when abs(raw_scale_counts::double precision - (-2147483000)::double precision) <= 1000 then null
+        else raw_scale_counts::double precision
+      end) as raw_scale_counts,
+      count(*) filter (
+        where raw_scale_counts is not null
+          and abs(raw_scale_counts::double precision - (-2147483000)::double precision) <= 1000
+      )::int as raw_scale_error_samples,
       avg(battery_v) as battery_v,
       avg(battery_pct) as battery_pct,
       avg(battery_charge_rate) as battery_charge_rate,
@@ -148,6 +162,8 @@ as $$
     device_id,
     weight_lbs,
     filtered_weight_lbs,
+    raw_scale_counts,
+    raw_scale_error_samples,
     battery_v,
     battery_pct,
     battery_charge_rate,

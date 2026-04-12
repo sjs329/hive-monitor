@@ -393,6 +393,21 @@ initOverviewConfigEditor();
 renderOverviewLoading("Loading hives...");
 refreshOverview();
 
+let overviewRefreshTimer = null;
+
+function getOverviewRefreshInterval_() {
+  const hiddenMs = Number(window.HIDDEN_TAB_REFRESH_MS);
+  if (document.hidden && Number.isFinite(hiddenMs) && hiddenMs > 0) return hiddenMs;
+  return AUTO_REFRESH_MS;
+}
+
+function scheduleOverviewRefresh_() {
+  clearTimeout(overviewRefreshTimer);
+  overviewRefreshTimer = setTimeout(() => {
+    refreshOverview().finally(scheduleOverviewRefresh_);
+  }, getOverviewRefreshInterval_());
+}
+
 // Sync server-side hive config in the background so a slow config endpoint
 // does not block first paint or manual refresh latency.
 ensureConfiguredHivesLoaded_().then((changed) => {
@@ -402,5 +417,12 @@ ensureConfiguredHivesLoaded_().then((changed) => {
     refreshOverview();
   }
 }).finally(() => {
-  setInterval(refreshOverview, AUTO_REFRESH_MS);
+  scheduleOverviewRefresh_();
+});
+
+document.addEventListener("visibilitychange", () => {
+  scheduleOverviewRefresh_();
+  if (!document.hidden) {
+    refreshOverview();
+  }
 });

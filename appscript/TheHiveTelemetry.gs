@@ -22,6 +22,7 @@ const WEIGHT_FILTER_UNLOCK_MIN_POINTS = 4;
 const WEIGHT_FILTER_UNLOCK_MIN_MINUTES = 20;
 const WEIGHT_INVALID_CALIBRATION_SENTINEL_LBS = -1234.5;
 const WEIGHT_READ_FAILED_SENTINEL_LBS = -2234.5;
+const RAW_SCALE_READ_FAILED_SENTINEL_COUNTS = -2147483000;
 const WEIGHT_SENTINEL_EPS = 0.02;
 
 // ── Webhook receiver (Arduino Cloud POST) ────────────────────────────────────
@@ -711,6 +712,7 @@ function parseArduinoPayload_(p) {
   let stayAwakeForUpdate = null;
   let temp = NaN; 
   let humidity = NaN;
+  let rawScaleCounts = NaN;
   let weightPresent = false;
   let weightReadFailed = false;
 
@@ -750,6 +752,14 @@ function parseArduinoPayload_(p) {
         weightPresent = true;
         const parsed = parseWeightMaybeNull_(v);
         weightLbs = parsed == null ? NaN : parsed;
+      } else if (name === "raw_scale_counts") {
+        const counts = Number(v);
+        if (Number.isFinite(counts)) {
+          rawScaleCounts = counts;
+          if (Math.abs(counts - RAW_SCALE_READ_FAILED_SENTINEL_COUNTS) <= 1000) {
+            weightReadFailed = true;
+          }
+        }
       } else if (name === "weight_kg") {
         const kg = Number(v);
         if (Number.isFinite(kg)) {
@@ -781,6 +791,7 @@ function parseArduinoPayload_(p) {
     stay_awake_for_update: stayAwakeForUpdate,
     temperature_c: Number.isFinite(temp) ? temp : null,
     humidity_pct: Number.isFinite(humidity) ? humidity : null,
+    raw_scale_counts: Number.isFinite(rawScaleCounts) ? rawScaleCounts : null,
     weight_present: weightPresent,
     weight_read_failed: weightReadFailed,
     source: "arduino-cloud"
@@ -833,6 +844,7 @@ function mergeWithLastKnownState_(incoming) {
     rapid_update_streak: rapidUpdateStreak,
     temperature_c: incoming.temperature_c ?? prev.temperature_c ?? null,
     humidity_pct: incoming.humidity_pct ?? prev.humidity_pct ?? null,
+    raw_scale_counts: incoming.raw_scale_counts ?? null,
     weight_read_failed: incoming.weight_read_failed === true,
     source: incoming.source || "arduino-cloud",
     fw_last_filtered: filteredState.state.fw_last_filtered,
@@ -980,6 +992,7 @@ function writeSupabaseBestEffort_(merged, raw) {
     battery_connected: merged.battery_connected,
     temperature_c: merged.temperature_c,
     humidity_pct: merged.humidity_pct,
+    raw_scale_counts: merged.raw_scale_counts,
     source: merged.source || "arduino-cloud",
     event_raw: eventRaw
   };

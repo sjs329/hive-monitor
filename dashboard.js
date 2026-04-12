@@ -86,6 +86,14 @@ const WEIGHT_NO_DATA_DEFAULT_TEXT = "No weight data yet — add a weight sensor 
 const WEIGHT_NEEDS_CALIBRATION_TEXT = "Scale not calibrated yet. In IoT Cloud, run Tare with empty hive, then Calibrate with a known weight.";
 const WEIGHT_SENSOR_FAILURE_TIMEOUT_MS = 60 * 60 * 1000;
 const WEIGHT_SENSOR_FAILURE_TEXT = "Sensor read failure";
+const INCLUDE_EVENT_RAW_COLUMN = false;
+const BUCKET_TIER_MAX_24H = 24;
+const BUCKET_TIER_MAX_7D = 168;
+const BUCKET_TIER_MAX_30D = 720;
+const BUCKET_MINUTES_24H = 5;
+const BUCKET_MINUTES_7D = 15;
+const BUCKET_MINUTES_30D = 60;
+const BUCKET_MINUTES_OLDER = 180;
 
 function isInvalidCalibrationWeight_(value) {
   const n = Number(value);
@@ -129,6 +137,12 @@ function getRawScaleCounts_(row) {
   }
 
   return null;
+}
+
+function getRawScaleErrorSamples_(row) {
+  if (!row) return 0;
+  const n = Number(row.raw_scale_error_samples);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
 }
 
 const PLOTLY_LAYOUT_BASE = {
@@ -224,7 +238,9 @@ async function fetchTelemetryPage(limit, beforeTsIso = null) {
   }
 
   const query = new URLSearchParams({
-    select: "ts,device_id,weight_lbs,filtered_weight_lbs,battery_v,battery_pct,battery_charge_rate,battery_connected,temperature_c,humidity_pct,source,event_raw",
+    select: INCLUDE_EVENT_RAW_COLUMN
+      ? "ts,device_id,weight_lbs,filtered_weight_lbs,raw_scale_counts,battery_v,battery_pct,battery_charge_rate,battery_connected,temperature_c,humidity_pct,source,event_raw"
+      : "ts,device_id,weight_lbs,filtered_weight_lbs,raw_scale_counts,battery_v,battery_pct,battery_charge_rate,battery_connected,temperature_c,humidity_pct,source",
     order: "ts.desc",
     limit: String(limit),
   });
@@ -238,6 +254,106 @@ async function fetchTelemetryPage(limit, beforeTsIso = null) {
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return mapSupabaseRows(await res.json());
+}
+
+async function fetchTelemetrySeries_(hours, bucketMinutes) {
+  if (!SUPABASE_ANON_KEY) {
+    throw new Error("Missing SUPABASE_ANON_KEY in hives.js");
+  }
+  if (!deviceId) return [];
+
+  const url = `${SUPABASE_URL.replace(/\/$/, "")}/rest/v1/rpc/get_series`;
+  const res = await fetch(url, {
+    method: "POST",
+    cache: "no-store",
+    headers: {
+      "Content-Type": "application/json",
+      ...supabaseAuthHeaders(),
+    },
+    body: JSON.stringify({
+      p_device_id: deviceId,
+      p_hours: Math.max(1, Math.floor(hours)),
+      p_bucket_minutes: Math.max(1, Math.floor(bucketMinutes)),
+    }),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+  return (await res.json() || []).map(r => ({
+    ...r,
+    ts: new Date(r.timestamp_iso || r.ts),
+  }));
+}
+
+function getBucketTierRequests_(hours) {
+  const requestedHours = Number(hours);
+  if (!Number.isFinite(requestedHours) || requestedHours <= 0) return [];
+
+  const tiers = [
+    { maxHours: BUCKET_TIER_MAX_24H, bucketMinutes: BUCKET_MINUTES_24H },
+    { maxHours: BUCKET_TIER_MAX_7D, bucketMinutes: BUCKET_MINUTES_7D },
+    { maxHours: BUCKET_TIER_MAX_30D, bucketMinutes: BUCKET_MINUTES_30D },
+    { maxHours: requestedHours, bucketMinutes: BUCKET_MINUTES_OLDER },
+  ];
+
+  const requests = [];
+  let coveredHours = 0;
+  for (const tier of tiers) {
+    const endHours = Math.min(requestedHours, tier.maxHours);
+    if (endHours <= coveredHours) continue;
+
+    requests.push({
+      newerThanHoursAgo: coveredHours,
+      olderThanHoursAgo: endHours,
+      p_hours: endHours,
+      p_bucket_minutes: tier.bucketMinutes,
+    });
+
+    coveredHours = endHours;
+    if (coveredHours >= requestedHours) break;
+  }
+
+  return requests;
+}
+
+function filterRowsByAgeWindow_(rows, newerThanHoursAgo, olderThanHoursAgo) {
+  const nowMs = Date.now();
+  const newerCutoffMs = nowMs - Math.max(0, newerThanHoursAgo) * 3600 * 1000;
+  const olderCutoffMs = nowMs - Math.max(0, olderThanHoursAgo) * 3600 * 1000;
+
+  return (rows || []).filter(r => {
+    if (!(r.ts instanceof Date) || Number.isNaN(r.ts.getTime())) return false;
+    const tsMs = r.ts.getTime();
+    return tsMs <= newerCutoffMs && tsMs > olderCutoffMs;
+  });
+}
+
+function dedupeAndSortRowsAsc_(rows) {
+  const byKey = new Map();
+  for (const row of rows || []) {
+    const ts = row.timestamp_iso || (row.ts instanceof Date ? row.ts.toISOString() : "");
+    const key = `${String(row.device_id || "")}|${String(ts)}`;
+    byKey.set(key, row);
+  }
+
+  return Array.from(byKey.values()).sort((a, b) => {
+    const ta = a.ts instanceof Date ? a.ts.getTime() : 0;
+    const tb = b.ts instanceof Date ? b.ts.getTime() : 0;
+    return ta - tb;
+  });
+}
+
+async function fetchTieredBucketedHistory_(hours) {
+  const requests = getBucketTierRequests_(hours);
+  if (!requests.length) return [];
+
+  const allRowsBucketed = [];
+  for (const req of requests) {
+    const rows = await fetchTelemetrySeries_(req.p_hours, req.p_bucket_minutes);
+    const filtered = filterRowsByAgeWindow_(rows, req.newerThanHoursAgo, req.olderThanHoursAgo);
+    allRowsBucketed.push(...filtered);
+  }
+
+  return dedupeAndSortRowsAsc_(allRowsBucketed);
 }
 
 function applyCurrentView() {
@@ -259,6 +375,7 @@ function buildWeightPlotContext_(rows) {
       rawWeight: getWeightLbs_(r),
       filteredWeight: getFilteredWeightLbs_(r),
       rawCounts: getRawScaleCounts_(r),
+      rawScaleErrorSamples: getRawScaleErrorSamples_(r),
     }))
     .filter(p => p.ts instanceof Date && !Number.isNaN(p.ts.getTime()) && p.rawWeight != null && !isInvalidCalibrationWeight_(p.rawWeight));
 
@@ -293,10 +410,17 @@ function buildWeightPlotContext_(rows) {
   const rawCountsErrorPoints = [];
   let lastValidCounts = null;
   for (const p of points) {
-    if (!Number.isFinite(p.rawCounts)) continue;
-    if (isRawScaleSensorError_(p.rawCounts)) {
+    const hasSentinelError = Number.isFinite(p.rawCounts) && isRawScaleSensorError_(p.rawCounts);
+    const hasBucketedError = p.rawScaleErrorSamples > 0;
+    if (hasSentinelError || hasBucketedError) {
       rawCountsErrorPoints.push({ ts: p.ts, displayCounts: lastValidCounts });
-    } else {
+    }
+
+    if (!Number.isFinite(p.rawCounts) || hasSentinelError) {
+      continue;
+    }
+
+    {
       rawCountsPoints.push(p);
       lastValidCounts = p.rawCounts;
     }
@@ -359,10 +483,17 @@ function sliceWeightPlotContextByHours_(weightCtx, hours) {
   const rawCountsPoints = [];
   const rawCountsErrorPoints = [];
   for (const p of slicedPoints) {
-    if (!Number.isFinite(p.rawCounts)) continue;
-    if (isRawScaleSensorError_(p.rawCounts)) {
+    const hasSentinelError = Number.isFinite(p.rawCounts) && isRawScaleSensorError_(p.rawCounts);
+    const hasBucketedError = Number(p.rawScaleErrorSamples) > 0;
+    if (hasSentinelError || hasBucketedError) {
       rawCountsErrorPoints.push({ ts: p.ts, displayCounts: lastValidCounts });
-    } else {
+    }
+
+    if (!Number.isFinite(p.rawCounts) || hasSentinelError) {
+      continue;
+    }
+
+    {
       rawCountsPoints.push(p);
       lastValidCounts = p.rawCounts;
     }
@@ -832,8 +963,8 @@ function renderWeightChart(rows, weightCtx) {
     y: withWeight.map(r => r.rawWeight),
     mode: "lines+markers",
     name: "Raw",
-    line: { color: "rgba(200,130,10,0.2)", width: 1, dash: "dot" },
-    marker: { size: 2, color: "rgba(200,130,10,0.18)" },
+    line: { color: "rgba(200,130,10,0.42)", width: 1.5, dash: "dot" },
+    marker: { size: 2.5, color: "rgba(200,130,10,0.36)" },
     hovertemplate: "%{y:.3f} lbs (raw)<extra></extra>",
   };
 
@@ -1104,16 +1235,7 @@ document.querySelectorAll(".range-btn").forEach(btn => {
     document.querySelectorAll(".range-btn").forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     activeHours = Number(btn.dataset.hours);
-    applyCurrentView();
-
-    // If the newly selected range needs older points, continue paginating in background.
-    loadMoreHistoryInBackground(refreshSeq).catch(err => {
-      isHistoryLoading = false;
-      updateHeaderTimes_();
-      const errBanner = document.getElementById("error-banner");
-      errBanner.textContent = "Background history load failed: " + err.message;
-      errBanner.classList.remove("hidden");
-    });
+    refresh();
   });
 });
 
@@ -1142,11 +1264,17 @@ async function refresh() {
     hasCompleteHistory = false;
     updateHeaderTimes_();
 
-    const firstPageDesc = await fetchTelemetryPage(FETCH_LIMIT, null);
-    allRows = normalizeRowsForCharts(firstPageDesc);
-    recomputeWeightCtx_();
-    if (!firstPageDesc.length) {
+    if (activeHours > 0) {
+      allRows = await fetchTieredBucketedHistory_(activeHours);
       hasCompleteHistory = true;
+      recomputeWeightCtx_();
+    } else {
+      const firstPageDesc = await fetchTelemetryPage(FETCH_LIMIT, null);
+      allRows = normalizeRowsForCharts(firstPageDesc);
+      recomputeWeightCtx_();
+      if (!firstPageDesc.length) {
+        hasCompleteHistory = true;
+      }
     }
 
     if (seq !== refreshSeq) return;
@@ -1162,13 +1290,15 @@ async function refresh() {
 
     applyCurrentView();
 
-    loadMoreHistoryInBackground(seq).catch(err => {
-      if (seq !== refreshSeq) return;
-      isHistoryLoading = false;
-      updateHeaderTimes_();
-      errBanner.textContent = "Background history load failed: " + err.message;
-      errBanner.classList.remove("hidden");
-    });
+    if (activeHours === 0) {
+      loadMoreHistoryInBackground(seq).catch(err => {
+        if (seq !== refreshSeq) return;
+        isHistoryLoading = false;
+        updateHeaderTimes_();
+        errBanner.textContent = "Background history load failed: " + err.message;
+        errBanner.classList.remove("hidden");
+      });
+    }
 
     document.getElementById("last-updated").textContent =
       formatHistoryTs(new Date());
@@ -1186,8 +1316,22 @@ async function refresh() {
 // Auto-refresh
 function scheduleRefresh() {
   clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(() => { refresh().then(scheduleRefresh); }, AUTO_REFRESH_MS);
+  const hiddenMs = Number(window.HIDDEN_TAB_REFRESH_MS);
+  const waitMs = (document.hidden && Number.isFinite(hiddenMs) && hiddenMs > 0)
+    ? hiddenMs
+    : AUTO_REFRESH_MS;
+
+  refreshTimer = setTimeout(() => {
+    refresh().then(scheduleRefresh).catch(scheduleRefresh);
+  }, waitMs);
 }
 
 // Boot
 refresh().then(scheduleRefresh);
+
+document.addEventListener("visibilitychange", () => {
+  scheduleRefresh();
+  if (!document.hidden) {
+    refresh();
+  }
+});
