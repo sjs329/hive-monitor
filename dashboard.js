@@ -991,7 +991,7 @@ function layout(yTitle, extraY) {
   };
 }
 
-function renderWeightChart(rows, weightCtx) {
+function renderWeightChart(rows, weightCtx, xRange) {
   const withWeight = weightCtx ? weightCtx.points : [];
   const hasInvalidWeight = weightCtx ? weightCtx.hasInvalidWeight : false;
   const weightFailure = getWeightFailureState_(rows, weightCtx);
@@ -1021,10 +1021,6 @@ function renderWeightChart(rows, weightCtx) {
     noDataMsg.classList.add("hidden");
   }
   document.getElementById("chart-weight").style.display = "";
-
-  const xRange = withWeight.length
-    ? [withWeight[0].ts, withWeight[withWeight.length - 1].ts]
-    : undefined;
 
   const filteredTrace = {
     x: withWeight.map(r => r.ts),
@@ -1064,7 +1060,7 @@ function renderWeightChart(rows, weightCtx) {
   bindXAxisSync_("chart-weight");
 }
 
-function renderRawCountsChart_(rows, weightCtx) {
+function renderRawCountsChart_(rows, weightCtx, xRange) {
   const wrap = document.getElementById("raw-counts-wrap");
   const chart = document.getElementById("chart-raw-counts");
   const noData = document.getElementById("raw-counts-no-data");
@@ -1089,10 +1085,6 @@ function renderRawCountsChart_(rows, weightCtx) {
 
   noData.classList.add("hidden");
   chart.style.display = "";
-
-  const xRange = weightPoints.length
-    ? [weightPoints[0].ts, weightPoints[weightPoints.length - 1].ts]
-    : undefined;
 
   const traces = [{
     x: rawPoints.map(p => p.ts),
@@ -1123,7 +1115,7 @@ function renderRawCountsChart_(rows, weightCtx) {
   bindXAxisSync_("chart-raw-counts");
 }
 
-function renderBatteryPctChart(rows) {
+function renderBatteryPctChart(rows, xRange) {
   const x = rows.map(r => r.ts);
   const y = rows.map(r => r.battery_pct);
 
@@ -1137,6 +1129,7 @@ function renderBatteryPctChart(rows) {
     hovertemplate: "%{y:.1f}%<extra></extra>",
   }], {
     ...layout("%"),
+    xaxis: { ...PLOTLY_LAYOUT_BASE.xaxis, range: xRange },
     yaxis: { ...layout("%").yaxis, range: [0, 115] },
     shapes: [{
       type: "line", y0: 20, y1: 20, x0: 0, x1: 1, xref: "paper",
@@ -1147,7 +1140,7 @@ function renderBatteryPctChart(rows) {
   bindXAxisSync_("chart-battery-pct");
 }
 
-function renderBatteryVChart(rows) {
+function renderBatteryVChart(rows, xRange) {
   Plotly.react("chart-battery-v", [{
     x: rows.map(r => r.ts),
     y: rows.map(r => r.battery_v),
@@ -1155,12 +1148,12 @@ function renderBatteryVChart(rows) {
     name: "Voltage (V)",
     line: { color: "#1f4f82", width: 2.5 },
     hovertemplate: "%{y:.4f} V<extra></extra>",
-  }], layout("V"), { responsive: true });
+  }], { ...layout("V"), xaxis: { ...PLOTLY_LAYOUT_BASE.xaxis, range: xRange } }, { responsive: true });
 
   bindXAxisSync_("chart-battery-v");
 }
 
-function renderChargeRateChart(rows) {
+function renderChargeRateChart(rows, xRange) {
   const estimated = buildEstimatedRateSeries(rows);
 
   const traces = [];
@@ -1180,7 +1173,7 @@ function renderChargeRateChart(rows) {
     ...layout("%/hr"),
     xaxis: {
       ...PLOTLY_LAYOUT_BASE.xaxis,
-      range: rows.length ? [rows[0].ts, rows[rows.length - 1].ts] : undefined,
+      range: xRange,
     },
     shapes: [{
       type: "line", y0: 0, y1: 0, x0: 0, x1: 1, xref: "paper",
@@ -1193,7 +1186,7 @@ function renderChargeRateChart(rows) {
   bindXAxisSync_("chart-charge-rate");
 }
 
-function renderTempHumidityChart(rows) {
+function renderTempHumidityChart(rows, xRange) {
   const withData = rows.filter(r => getTemperatureF_(r) != null || getHumidityPct_(r) != null);
   const noDataMsg = document.getElementById("temp-humidity-no-data");
 
@@ -1229,6 +1222,7 @@ function renderTempHumidityChart(rows) {
   ], {
     ...PLOTLY_LAYOUT_BASE,
     uirevision: activeHours,
+    xaxis: { ...PLOTLY_LAYOUT_BASE.xaxis, range: xRange },
     yaxis:  { ...PLOTLY_LAYOUT_BASE.yaxis, title: "°F" },
     yaxis2: { title: "%", overlaying: "y", side: "right", gridcolor: "rgba(0,0,0,0)", zeroline: false },
   }, { responsive: true });
@@ -1236,13 +1230,26 @@ function renderTempHumidityChart(rows) {
   bindXAxisSync_("chart-temp-humidity");
 }
 
+function getActiveXRange_() {
+  for (const id of ALL_SYNCED_CHART_IDS) {
+    if (id === "chart-raw-counts") continue;
+    const el = document.getElementById(id);
+    if (el && el._fullLayout && el.style.display !== "none") {
+      const r = el._fullLayout.xaxis.range;
+      if (r && r.length === 2) return r;
+    }
+  }
+  return null;
+}
+
 function renderAll(rows, weightCtx) {
-  renderWeightChart(rows, weightCtx);
-  renderRawCountsChart_(rows, weightCtx);
-  renderBatteryPctChart(rows);
-  renderBatteryVChart(rows);
-  renderChargeRateChart(rows);
-  renderTempHumidityChart(rows);
+  const sharedXRange = rows.length ? [rows[0].ts, rows[rows.length - 1].ts] : undefined;
+  renderWeightChart(rows, weightCtx, sharedXRange);
+  renderRawCountsChart_(rows, weightCtx, sharedXRange);
+  renderBatteryPctChart(rows, sharedXRange);
+  renderBatteryVChart(rows, sharedXRange);
+  renderChargeRateChart(rows, sharedXRange);
+  renderTempHumidityChart(rows, sharedXRange);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1263,7 +1270,8 @@ if (rawCountsToggleBtn) {
     showRawCountsDebug = !showRawCountsDebug;
     const filtered = filterByHours(allRows, activeHours);
     const weightCtx = sliceWeightPlotContextByHours_(fullWeightCtx, activeHours);
-    renderRawCountsChart_(filtered, weightCtx);
+    const xRange = showRawCountsDebug ? getActiveXRange_() : undefined;
+    renderRawCountsChart_(filtered, weightCtx, xRange);
   });
 }
 
