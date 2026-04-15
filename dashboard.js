@@ -955,7 +955,7 @@ function bindXAxisSync_(chartId) {
     const isAutorange = ev["xaxis.autorange"];
     const r0 = ev["xaxis.range[0]"];
     const r1 = ev["xaxis.range[1]"];
-    if (!isAutorange && (!r0 || !r1)) return;
+    if (!isAutorange && (r0 == null || r1 == null)) return;
 
     isSyncingAxisRange = true;
     try {
