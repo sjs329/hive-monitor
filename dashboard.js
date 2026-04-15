@@ -58,8 +58,7 @@ let historyLoadSeq = 0;
 let hasCompleteHistory = false;
 let isHistoryLoading = false;
 let showRawCountsDebug = false;
-let hasWeightChartSyncBinding = false;
-let hasRawChartSyncBinding = false;
+const chartSyncBound = new Set();
 let isSyncingAxisRange = false;
 let fullWeightCtx = null;
 
@@ -934,6 +933,55 @@ function updateStats(rows, trendRows = rows, weightCtx = null) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Charts
 // ─────────────────────────────────────────────────────────────────────────────
+
+const ALL_SYNCED_CHART_IDS = [
+  "chart-weight",
+  "chart-raw-counts",
+  "chart-temp-humidity",
+  "chart-battery-pct",
+  "chart-battery-v",
+  "chart-charge-rate",
+];
+
+function bindXAxisSync_(chartId) {
+  if (chartSyncBound.has(chartId)) return;
+  const el = document.getElementById(chartId);
+  if (!el) return;
+
+  el.on("plotly_relayout", (ev) => {
+    if (isSyncingAxisRange) return;
+    if (chartId === "chart-raw-counts" && !showRawCountsDebug) return;
+
+    const isAutorange = ev["xaxis.autorange"];
+    const r0 = ev["xaxis.range[0]"];
+    const r1 = ev["xaxis.range[1]"];
+    if (!isAutorange && (!r0 || !r1)) return;
+
+    isSyncingAxisRange = true;
+    try {
+      ALL_SYNCED_CHART_IDS.forEach(otherId => {
+        if (otherId === chartId) return;
+        if (otherId === "chart-raw-counts" && !showRawCountsDebug) return;
+        const otherEl = document.getElementById(otherId);
+        if (!otherEl || otherEl.style.display === "none") return;
+
+        if (isAutorange) {
+          Plotly.relayout(otherEl, { "xaxis.autorange": true });
+        } else {
+          Plotly.relayout(otherEl, {
+            "xaxis.range[0]": r0,
+            "xaxis.range[1]": r1,
+          });
+        }
+      });
+    } finally {
+      setTimeout(() => { isSyncingAxisRange = false; }, 0);
+    }
+  });
+
+  chartSyncBound.add(chartId);
+}
+
 function layout(yTitle, extraY) {
   return {
     ...PLOTLY_LAYOUT_BASE,
@@ -1013,35 +1061,7 @@ function renderWeightChart(rows, weightCtx) {
     yaxis: { ...layout("lbs").yaxis },
   }, { responsive: true });
 
-  if (!hasWeightChartSyncBinding) {
-    const weightChartEl = document.getElementById("chart-weight");
-    if (weightChartEl) {
-      weightChartEl.on("plotly_relayout", (ev) => {
-        if (!showRawCountsDebug) return;
-        if (isSyncingAxisRange) return;
-        const rawChartEl = document.getElementById("chart-raw-counts");
-        if (!rawChartEl) return;
-
-        isSyncingAxisRange = true;
-        try {
-          if (ev["xaxis.autorange"]) {
-            Plotly.relayout(rawChartEl, { "xaxis.autorange": true });
-            return;
-          }
-
-          if (ev["xaxis.range[0]"] && ev["xaxis.range[1]"]) {
-            Plotly.relayout(rawChartEl, {
-              "xaxis.range[0]": ev["xaxis.range[0]"],
-              "xaxis.range[1]": ev["xaxis.range[1]"],
-            });
-          }
-        } finally {
-          setTimeout(() => { isSyncingAxisRange = false; }, 0);
-        }
-      });
-      hasWeightChartSyncBinding = true;
-    }
-  }
+  bindXAxisSync_("chart-weight");
 }
 
 function renderRawCountsChart_(rows, weightCtx) {
@@ -1100,32 +1120,7 @@ function renderRawCountsChart_(rows, weightCtx) {
     xaxis: { ...PLOTLY_LAYOUT_BASE.xaxis, range: xRange },
   }, { responsive: true });
 
-  if (!hasRawChartSyncBinding) {
-    chart.on("plotly_relayout", (ev) => {
-      if (!showRawCountsDebug) return;
-      if (isSyncingAxisRange) return;
-      const weightChartEl = document.getElementById("chart-weight");
-      if (!weightChartEl) return;
-
-      isSyncingAxisRange = true;
-      try {
-        if (ev["xaxis.autorange"]) {
-          Plotly.relayout(weightChartEl, { "xaxis.autorange": true });
-          return;
-        }
-
-        if (ev["xaxis.range[0]"] && ev["xaxis.range[1]"]) {
-          Plotly.relayout(weightChartEl, {
-            "xaxis.range[0]": ev["xaxis.range[0]"],
-            "xaxis.range[1]": ev["xaxis.range[1]"],
-          });
-        }
-      } finally {
-        setTimeout(() => { isSyncingAxisRange = false; }, 0);
-      }
-    });
-    hasRawChartSyncBinding = true;
-  }
+  bindXAxisSync_("chart-raw-counts");
 }
 
 function renderBatteryPctChart(rows) {
@@ -1148,6 +1143,8 @@ function renderBatteryPctChart(rows) {
       line: { color: "var(--danger)", width: 1, dash: "dot" }
     }]
   }, { responsive: true });
+
+  bindXAxisSync_("chart-battery-pct");
 }
 
 function renderBatteryVChart(rows) {
@@ -1159,6 +1156,8 @@ function renderBatteryVChart(rows) {
     line: { color: "#1f4f82", width: 2.5 },
     hovertemplate: "%{y:.4f} V<extra></extra>",
   }], layout("V"), { responsive: true });
+
+  bindXAxisSync_("chart-battery-v");
 }
 
 function renderChargeRateChart(rows) {
@@ -1190,6 +1189,8 @@ function renderChargeRateChart(rows) {
   };
 
   Plotly.react("chart-charge-rate", traces, chartLayout, { responsive: true });
+
+  bindXAxisSync_("chart-charge-rate");
 }
 
 function renderTempHumidityChart(rows) {
@@ -1231,6 +1232,8 @@ function renderTempHumidityChart(rows) {
     yaxis:  { ...PLOTLY_LAYOUT_BASE.yaxis, title: "°F" },
     yaxis2: { title: "%", overlaying: "y", side: "right", gridcolor: "rgba(0,0,0,0)", zeroline: false },
   }, { responsive: true });
+
+  bindXAxisSync_("chart-temp-humidity");
 }
 
 function renderAll(rows, weightCtx) {
