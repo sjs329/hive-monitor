@@ -42,7 +42,7 @@
       <div class="stat-card stat-card--hive">
         <div class="stat-label">Temperature</div>
         <div class="stat-value" id="stat-temp">—</div>
-        <div class="stat-unit">°C</div>
+        <div class="stat-unit">°F</div>
       </div>
       <div class="stat-card stat-card--hive">
         <div class="stat-label">Humidity</div>
@@ -63,11 +63,6 @@
         <div class="stat-label">Voltage</div>
         <div class="stat-value" id="stat-battery-v">—</div>
         <div class="stat-unit">V</div>
-      </div>
-      <div class="stat-card stat-card--minor">
-        <div class="stat-label">Charge Rate</div>
-        <div class="stat-value" id="stat-charge-rate">—</div>
-        <div class="stat-unit">%/hr</div>
       </div>
       <div class="stat-card stat-card--minor">
         <div class="stat-label">Rate (Estimated)</div>
@@ -110,7 +105,7 @@
     <div class="chart-card" id="temp-humidity-card">
       <h2>Temperature &amp; Humidity</h2>
       <div id="chart-temp-humidity" class="chart-container"></div>
-      <p class="no-data-msg hidden" id="temp-humidity-no-data">No temperature/humidity data yet — add a sensor to your Arduino Thing to enable this chart.</p>
+      <p class="no-data-msg hidden" id="temp-humidity-no-data">No temperature/humidity data yet — the sensor may be disconnected or not configured.</p>
     </div>
 
     <!-- Monitor charts -->
@@ -127,7 +122,7 @@
     </div>
 
     <div class="chart-card chart-card--minor">
-      <h2>Charge Rate</h2>
+      <h2>Estimated Battery Drain Rate</h2>
       <div id="chart-charge-rate" class="chart-container"></div>
     </div>
   </main>

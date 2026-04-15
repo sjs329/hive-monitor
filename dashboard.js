@@ -94,6 +94,8 @@ const BUCKET_MINUTES_24H = 5;
 const BUCKET_MINUTES_7D = 15;
 const BUCKET_MINUTES_30D = 60;
 const BUCKET_MINUTES_OLDER = 180;
+const TEMP_SENSOR_NOT_CONNECTED_SENTINEL_F = -999.0;
+const HUMIDITY_SENSOR_NOT_CONNECTED_SENTINEL_PCT = -1.0;
 
 function isInvalidCalibrationWeight_(value) {
   const n = Number(value);
@@ -119,6 +121,37 @@ function getFilteredWeightLbs_(row) {
   if (!row) return null;
   const n = Number(row.filtered_weight_lbs);
   return Number.isFinite(n) ? n : null;
+}
+
+function getTemperatureF_(row) {
+  if (!row) return null;
+
+  const tempFValue = row.temp_f;
+  if (tempFValue != null && String(tempFValue).trim() !== "") {
+    const directF = Number(tempFValue);
+    if (Number.isFinite(directF)) {
+      if (Math.abs(directF - TEMP_SENSOR_NOT_CONNECTED_SENTINEL_F) <= 0.25) return null;
+      return directF;
+    }
+  }
+
+  const tempCValue = row.temperature_c;
+  if (tempCValue == null || String(tempCValue).trim() === "") return null;
+
+  const c = Number(tempCValue);
+  if (!Number.isFinite(c) || c <= -200) return null;
+  return (c * 9 / 5) + 32;
+}
+
+function getHumidityPct_(row) {
+  if (!row) return null;
+
+  const humidityValue = row.humidity_pct;
+  if (humidityValue == null || String(humidityValue).trim() === "") return null;
+
+  const n = Number(humidityValue);
+  if (!Number.isFinite(n) || Math.abs(n - HUMIDITY_SENSOR_NOT_CONNECTED_SENTINEL_PCT) <= 0.25 || n < 0) return null;
+  return n;
 }
 
 function getRawScaleCounts_(row) {
@@ -239,8 +272,8 @@ async function fetchTelemetryPage(limit, beforeTsIso = null) {
 
   const query = new URLSearchParams({
     select: INCLUDE_EVENT_RAW_COLUMN
-      ? "ts,device_id,weight_lbs,filtered_weight_lbs,raw_scale_counts,battery_v,battery_pct,battery_charge_rate,battery_connected,temperature_c,humidity_pct,source,event_raw"
-      : "ts,device_id,weight_lbs,filtered_weight_lbs,raw_scale_counts,battery_v,battery_pct,battery_charge_rate,battery_connected,temperature_c,humidity_pct,source",
+      ? "ts,device_id,weight_lbs,filtered_weight_lbs,raw_scale_counts,battery_v,battery_pct,temperature_c,humidity_pct,source,event_raw"
+      : "ts,device_id,weight_lbs,filtered_weight_lbs,raw_scale_counts,battery_v,battery_pct,temperature_c,humidity_pct,source",
     order: "ts.desc",
     limit: String(limit),
   });
@@ -873,10 +906,6 @@ function updateStats(rows, trendRows = rows, weightCtx = null) {
   document.getElementById("stat-battery-v").textContent =
     v != null ? v.toFixed(3) : "—";
 
-  const rate = latest.battery_charge_rate;
-  document.getElementById("stat-charge-rate").textContent =
-    rate != null ? rate.toFixed(1) : "—";
-
   const trend = estimateShutdown(trendRows);
   const estRateEl = document.getElementById("stat-charge-rate-est");
   estRateEl.textContent = trend.rate != null ? trend.rate.toFixed(1) : "—";
@@ -893,11 +922,11 @@ function updateStats(rows, trendRows = rows, weightCtx = null) {
     etaEl.removeAttribute("aria-label");
   }
 
-  const temp = latest.temperature_c;
+  const temp = getTemperatureF_(latest);
   document.getElementById("stat-temp").textContent =
     temp != null ? temp.toFixed(1) : "—";
 
-  const hum = latest.humidity_pct;
+  const hum = getHumidityPct_(latest);
   document.getElementById("stat-humidity").textContent =
     hum != null ? hum.toFixed(1) : "—";
 }
@@ -1133,31 +1162,17 @@ function renderBatteryVChart(rows) {
 }
 
 function renderChargeRateChart(rows) {
-  const withReported = rows.filter(r => r.battery_charge_rate != null);
-  const x = withReported.map(r => r.ts);
-  const y = withReported.map(r => r.battery_charge_rate);
   const estimated = buildEstimatedRateSeries(rows);
 
-  // Colour positive vs negative (charging vs discharging)
   const traces = [];
-
-  if (x.length) {
-    traces.push({
-      x, y,
-      mode: "lines",
-      name: "Arduino rate (%/hr)",
-      line: { color: "#c8820a", width: 2 },
-      hovertemplate: "%{y:.1f} %/hr<extra></extra>",
-    });
-  }
 
   if (estimated.x.length) {
     traces.push({
       x: estimated.x,
       y: estimated.y,
       mode: "lines",
-      name: "Web estimate (%/hr)",
-      line: { color: "#1f4f82", width: 2, dash: "dot" },
+      name: "Estimated rate (%/hr)",
+      line: { color: "#1f4f82", width: 2.5, dash: "dot" },
       hovertemplate: "%{y:.1f} %/hr<extra></extra>",
     });
   }
@@ -1178,7 +1193,7 @@ function renderChargeRateChart(rows) {
 }
 
 function renderTempHumidityChart(rows) {
-  const withData = rows.filter(r => r.temperature_c != null || r.humidity_pct != null);
+  const withData = rows.filter(r => getTemperatureF_(r) != null || getHumidityPct_(r) != null);
   const noDataMsg = document.getElementById("temp-humidity-no-data");
 
   if (!withData.length) {
@@ -1194,16 +1209,16 @@ function renderTempHumidityChart(rows) {
   Plotly.react("chart-temp-humidity", [
     {
       x,
-      y: withData.map(r => r.temperature_c),
+      y: withData.map(r => getTemperatureF_(r)),
       mode: "lines",
-      name: "Temperature (°C)",
+      name: "Temperature (°F)",
       line: { color: "#c8820a", width: 2.5 },
       yaxis: "y1",
-      hovertemplate: "%{y:.1f} °C<extra></extra>",
+      hovertemplate: "%{y:.1f} °F<extra></extra>",
     },
     {
       x,
-      y: withData.map(r => r.humidity_pct),
+      y: withData.map(r => getHumidityPct_(r)),
       mode: "lines",
       name: "Humidity (%)",
       line: { color: "#1f4f82", width: 2.5, dash: "dot" },
@@ -1213,7 +1228,7 @@ function renderTempHumidityChart(rows) {
   ], {
     ...PLOTLY_LAYOUT_BASE,
     uirevision: activeHours,
-    yaxis:  { ...PLOTLY_LAYOUT_BASE.yaxis, title: "°C" },
+    yaxis:  { ...PLOTLY_LAYOUT_BASE.yaxis, title: "°F" },
     yaxis2: { title: "%", overlaying: "y", side: "right", gridcolor: "rgba(0,0,0,0)", zeroline: false },
   }, { responsive: true });
 }
@@ -1280,13 +1295,6 @@ async function refresh() {
     if (seq !== refreshSeq) return;
 
     errBanner.classList.add("hidden");
-
-    // Battery connection should not be shown as a normal stat; only warn on error.
-    const latest = allRows.length ? allRows[allRows.length - 1] : null;
-    if (latest && latest.battery_connected === false) {
-      errBanner.textContent = "Battery error: no battery reported by monitor.";
-      errBanner.classList.remove("hidden");
-    }
 
     applyCurrentView();
 

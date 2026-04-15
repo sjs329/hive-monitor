@@ -23,6 +23,8 @@ const WEIGHT_FILTER_UNLOCK_MIN_MINUTES = 20;
 const WEIGHT_INVALID_CALIBRATION_SENTINEL_LBS = -1234.5;
 const WEIGHT_READ_FAILED_SENTINEL_LBS = -2234.5;
 const RAW_SCALE_READ_FAILED_SENTINEL_COUNTS = -2147483000;
+const TEMP_SENSOR_NOT_CONNECTED_SENTINEL_F = -999.0;
+const HUMIDITY_SENSOR_NOT_CONNECTED_SENTINEL_PCT = -1.0;
 const WEIGHT_SENTINEL_EPS = 0.02;
 
 // ── Webhook receiver (Arduino Cloud POST) ────────────────────────────────────
@@ -713,6 +715,8 @@ function parseArduinoPayload_(p) {
   let temp = NaN; 
   let humidity = NaN;
   let rawScaleCounts = NaN;
+  let tempPresent = false;
+  let humidityPresent = false;
   let weightPresent = false;
   let weightReadFailed = false;
 
@@ -772,10 +776,30 @@ function parseArduinoPayload_(p) {
         weightPresent = true;
         const parsed = parseWeightMaybeNull_(v);
         weightLbs = parsed == null ? NaN : parsed;
+      } else if (name === "temp_f" || name === "temperature_f") {
+        tempPresent = true;
+        if (v != null && String(v).trim() !== "") {
+          const f = Number(v);
+          if (Number.isFinite(f) && Math.abs(f - TEMP_SENSOR_NOT_CONNECTED_SENTINEL_F) > WEIGHT_SENTINEL_EPS) {
+            temp = (f - 32) * (5 / 9);
+          }
+        }
       } else if (name === "temperature" || name === "temperature_c" || name === "temp") {
-        temp = Number(v);
+        tempPresent = true;
+        if (v != null && String(v).trim() !== "") {
+          const parsed = Number(v);
+          if (Number.isFinite(parsed) && parsed > -200) {
+            temp = parsed;
+          }
+        }
       } else if (name === "humidity" || name === "humidity_pct" || name === "relative_humidity") {
-        humidity = Number(v);
+        humidityPresent = true;
+        if (v != null && String(v).trim() !== "") {
+          const parsed = Number(v);
+          if (Number.isFinite(parsed) && Math.abs(parsed - HUMIDITY_SENSOR_NOT_CONNECTED_SENTINEL_PCT) > WEIGHT_SENTINEL_EPS) {
+            humidity = parsed;
+          }
+        }
       }
     }
   }
@@ -791,6 +815,8 @@ function parseArduinoPayload_(p) {
     stay_awake_for_update: stayAwakeForUpdate,
     temperature_c: Number.isFinite(temp) ? temp : null,
     humidity_pct: Number.isFinite(humidity) ? humidity : null,
+    temp_present: tempPresent,
+    humidity_present: humidityPresent,
     raw_scale_counts: Number.isFinite(rawScaleCounts) ? rawScaleCounts : null,
     weight_present: weightPresent,
     weight_read_failed: weightReadFailed,
@@ -838,12 +864,12 @@ function mergeWithLastKnownState_(incoming) {
     filtered_weight_lbs: filteredState.filtered,
     battery_v: incoming.battery_v ?? prev.battery_v ?? null,
     battery_pct: incoming.battery_pct ?? prev.battery_pct ?? null,
-    battery_charge_rate: incoming.battery_charge_rate ?? prev.battery_charge_rate ?? null,
-    battery_connected: incoming.battery_connected ?? prev.battery_connected ?? null,
+    battery_charge_rate: incoming.battery_charge_rate ?? null,
+    battery_connected: incoming.battery_connected ?? null,
     stay_awake_for_update: stayAwakeState,
     rapid_update_streak: rapidUpdateStreak,
-    temperature_c: incoming.temperature_c ?? prev.temperature_c ?? null,
-    humidity_pct: incoming.humidity_pct ?? prev.humidity_pct ?? null,
+    temperature_c: incoming.temp_present ? (incoming.temperature_c ?? null) : (prev.temperature_c ?? null),
+    humidity_pct: incoming.humidity_present ? (incoming.humidity_pct ?? null) : (prev.humidity_pct ?? null),
     raw_scale_counts: incoming.raw_scale_counts ?? null,
     weight_read_failed: incoming.weight_read_failed === true,
     source: incoming.source || "arduino-cloud",

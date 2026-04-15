@@ -45,6 +45,37 @@ function getWeightLbs_(row) {
   return Number.isFinite(legacy) ? legacy : null;
 }
 
+function getTemperatureF_(row) {
+  if (!row) return null;
+
+  const tempFValue = row.temp_f;
+  if (tempFValue != null && String(tempFValue).trim() !== "") {
+    const directF = Number(tempFValue);
+    if (Number.isFinite(directF)) {
+      if (directF <= -900) return null;
+      return directF;
+    }
+  }
+
+  const tempCValue = row.temperature_c;
+  if (tempCValue == null || String(tempCValue).trim() === "") return null;
+
+  const c = Number(tempCValue);
+  if (!Number.isFinite(c) || c <= -200) return null;
+  return (c * 9 / 5) + 32;
+}
+
+function getHumidityPct_(row) {
+  if (!row) return null;
+
+  const humidityValue = row.humidity_pct;
+  if (humidityValue == null || String(humidityValue).trim() === "") return null;
+
+  const n = Number(humidityValue);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return n;
+}
+
 function getHivesConfig_() {
   if (typeof getConfiguredHives === "function") return getConfiguredHives();
   return Array.isArray(HIVES_CONFIG) ? HIVES_CONFIG : [];
@@ -242,10 +273,10 @@ function buildCard(hive, latest) {
       ? "Sensor fail"
       : (weightState.weight != null ? Number(weightState.weight).toFixed(2) : null);
   const pct    = hasData && latest.battery_pct != null ? latest.battery_pct.toFixed(1) : null;
-  const volts  = hasData && latest.battery_v != null ? latest.battery_v.toFixed(3) : null;
-  const rate   = hasData && latest.battery_charge_rate != null ? latest.battery_charge_rate.toFixed(1) : null;
-  const temp   = hasData && latest.temperature_c != null ? latest.temperature_c.toFixed(1) : null;
-  const hum    = hasData && latest.humidity_pct != null ? latest.humidity_pct.toFixed(1) : null;
+  const tempVal = hasData ? getTemperatureF_(latest) : null;
+  const humVal  = hasData ? getHumidityPct_(latest) : null;
+  const temp   = tempVal != null ? tempVal.toFixed(1) : null;
+  const hum    = humVal != null ? humVal.toFixed(1) : null;
 
   if (!isActive) {
     const statusText = hive.active && !isConfigured ? "Missing Device ID" : "Coming Soon";
@@ -282,7 +313,7 @@ function buildCard(hive, latest) {
       </div>
       <div class="hc-stats">
         ${statLine("Weight", weight, hasInvalidWeight ? "" : "lbs")}
-        ${statLine("Temperature", temp, "°C")}
+        ${statLine("Temperature", temp, "°F")}
         ${statLine("Humidity", hum, "%")}
       </div>
       <div class="hc-monitor">
